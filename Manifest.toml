@@ -1,0 +1,10 @@
+# This file is machine-generated - editing it directly is not advised
+
+julia_version = "1.12.3"
+manifest_format = "2.0"
+project_hash = "3addb8029338162a91ad7b3268c6e5fa3615149f"
+
+[[deps.PtySessions]]
+path = "."
+uuid = "581b29ee-4021-4243-bea3-a8421693f905"
+version = "0.1.0"

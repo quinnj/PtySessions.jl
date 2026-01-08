@@ -1,0 +1,12 @@
+name = "PtySessions"
+uuid = "581b29ee-4021-4243-bea3-a8421693f905"
+version = "0.1.0"
+authors = ["Jacob Quinn <quinn.jacobd@gmail.com>"]
+
+[deps]
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
