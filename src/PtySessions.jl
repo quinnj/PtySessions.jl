@@ -1,6 +1,6 @@
 module PtySessions
 
-export PtySession, write, read, readline, readavailable, readuntil
+export PtySession, write, read, readline, readavailable, readuntil, write_with_timeout
 export isactive, close, kill, resize!, getsize
 
 using Base: Process
@@ -23,6 +23,17 @@ mutable struct PtySession
         finalizer(close, session)
         return session
     end
+end
+
+const DEFAULT_READAVAILABLE_MAX_BYTES = 64 * 1024
+const DEFAULT_WRITE_TIMEOUT_S = 1.0
+const POLLIN = Int16(0x0001)
+const POLLHUP = Int16(0x0010)
+
+struct PollFd
+    fd::Cint
+    events::Int16
+    revents::Int16
 end
 
 """
@@ -104,6 +115,11 @@ function PtySession(cmd::Cmd; env=ENV, dir=pwd())
         # Close our reference to slave (child has it open)
         close(slave_io)
 
+        F_GETFL = 3
+        F_SETFL = 4
+        flags = ccall(:fcntl, Cint, (Cint, Cint), master_fd, F_GETFL)
+        flags >= 0 && ccall(:fcntl, Cint, (Cint, Cint, Cint), master_fd, F_SETFL, flags | Base.Filesystem.JL_O_NONBLOCK)
+
         # The master is now our interface to the process
         return PtySession(process, Int(master_fd))
 
@@ -138,10 +154,82 @@ function Base.write(session::PtySession, data::Union{String, Vector{UInt8}})
                     session.master_fd, bytes, length(bytes))
 
     if written < 0
+        err = Libc.errno()
+        if err == Libc.EAGAIN || err == Libc.EWOULDBLOCK
+            return write_with_timeout(session, bytes)
+        end
         error("Failed to write to PTY: $(Base.Libc.strerror())")
     end
 
     return Int(written)
+end
+
+"""
+    write_with_timeout(session::PtySession, data::Union{String, Vector{UInt8}}; timeout_s::Real=DEFAULT_WRITE_TIMEOUT_S)
+
+Write data to the PTY session without blocking longer than `timeout_s`.
+
+# Arguments
+- `session::PtySession`: The PTY session
+- `data`: Data to write (String or bytes)
+- `timeout_s`: Maximum time in seconds to attempt the write
+
+# Returns
+- Number of bytes written
+"""
+function write_with_timeout(session::PtySession, data::Union{String, Vector{UInt8}}; timeout_s::Real=DEFAULT_WRITE_TIMEOUT_S)
+    if !isactive(session)
+        error("Cannot write to inactive session")
+    end
+
+    bytes = data isa String ? Vector{UInt8}(data) : data
+    total = 0
+    total_length = length(bytes)
+    total_length == 0 && return 0
+
+    # Set to non-blocking for the write loop.
+    F_GETFL = 3
+    F_SETFL = 4
+    O_NONBLOCK = Base.Filesystem.JL_O_NONBLOCK
+
+    old_flags = ccall(:fcntl, Cint, (Cint, Cint), session.master_fd, F_GETFL)
+    old_flags < 0 && return 0
+    needs_restore = (old_flags & O_NONBLOCK) == 0
+    if needs_restore
+        set_ret = ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, old_flags | O_NONBLOCK)
+        set_ret != 0 && return 0
+    end
+    deadline = time() + max(0.0, timeout_s)
+
+    try
+        while total < total_length
+            remaining = total_length - total
+            nwrite = ccall(:write, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
+                           session.master_fd, pointer(bytes, total + 1), remaining)
+
+            if nwrite > 0
+                total += nwrite
+                continue
+            elseif nwrite == 0
+                time() >= deadline && break
+            else
+                err = Libc.errno()
+                if err == Libc.EINTR
+                    continue
+                elseif err == Libc.EAGAIN || err == Libc.EWOULDBLOCK
+                    time() >= deadline && break
+                else
+                    error("Failed to write to PTY: $(Base.Libc.strerror())")
+                end
+            end
+
+            sleep(0.01)
+        end
+    finally
+        needs_restore && ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, old_flags)
+    end
+
+    return total
 end
 
 """
@@ -211,69 +299,52 @@ function Base.readline(session::PtySession; keep::Bool=false)
 end
 
 """
-    readavailable(session::PtySession)
+    readavailable(session::PtySession; max_bytes::Integer=DEFAULT_READAVAILABLE_MAX_BYTES)
 
 Read all currently available data from the PTY session without blocking.
 
 # Arguments
 - `session::PtySession`: The PTY session
+- `max_bytes::Integer`: Maximum bytes to read before returning (default: $(DEFAULT_READAVAILABLE_MAX_BYTES))
 
 # Returns
 - String: The available data
 """
-function readavailable(session::PtySession)
+function readavailable(session::PtySession; max_bytes::Integer=DEFAULT_READAVAILABLE_MAX_BYTES)
     if session.master_fd < 0
         return ""
     end
+    max_bytes <= 0 && return ""
 
-    # Use select to check if data is available without blocking
-    # struct timeval { long tv_sec; long tv_usec; }
-    timeout = zeros(Int64, 2)  # 0 seconds, 0 microseconds = immediate return
+    F_GETFL = 3
+    F_SETFL = 4
+    O_NONBLOCK = Base.Filesystem.JL_O_NONBLOCK
+    flags = ccall(:fcntl, Cint, (Cint, Cint), session.master_fd, F_GETFL)
+    if flags >= 0 && (flags & O_NONBLOCK) == 0
+        set_ret = ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, flags | O_NONBLOCK)
+        set_ret != 0 && return ""
+    end
 
-    # fd_set structure
-    fd_set = zeros(UInt8, 128)  # Usually sizeof(fd_set) = 128 bytes
-    # Set the bit for our fd
-    byte_idx = div(session.master_fd, 8)
-    bit_idx = mod(session.master_fd, 8)
-    fd_set[byte_idx + 1] |= (1 << bit_idx)
+    pfd = Ref(PollFd(Cint(session.master_fd), POLLIN, 0))
+    poll_ret = ccall(:poll, Cint, (Ptr{PollFd}, Cuint, Cint), pfd, 1, 0)
+    poll_ret <= 0 && return ""
+    revents = pfd[].revents
+    (revents & (POLLIN | POLLHUP)) == 0 && return ""
 
-    # Call select(nfds, readfds, writefds, exceptfds, timeout)
-    nfds = session.master_fd + 1
-    ret = ccall(:select, Cint, (Cint, Ptr{UInt8}, Ptr{Nothing}, Ptr{Nothing}, Ptr{Int64}),
-                nfds, fd_set, C_NULL, C_NULL, timeout)
-
-    if ret <= 0
-        # No data available or error
+    buffer = Vector{UInt8}(undef, min(4096, max_bytes))
+    nread = ccall(:read, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
+                  session.master_fd, buffer, length(buffer))
+    if nread > 0
+        return String(buffer[1:nread])
+    elseif nread == 0
         return ""
     end
 
-    # Data is available, read it
-    result = IOBuffer()
-    buffer = Vector{UInt8}(undef, 4096)
-
-    # Set to non-blocking for the read loop
-    F_GETFL = 3
-    F_SETFL = 4
-    O_NONBLOCK = 0x0004
-
-    old_flags = ccall(:fcntl, Cint, (Cint, Cint), session.master_fd, F_GETFL)
-    ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, old_flags | O_NONBLOCK)
-
-    while true
-        nread = ccall(:read, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
-                      session.master_fd, buffer, 4096)
-
-        if nread > 0
-            write(result, buffer[1:nread])
-        else
-            break
-        end
+    err = Libc.errno()
+    if err == Libc.EINTR || err == Libc.EAGAIN || err == Libc.EWOULDBLOCK
+        return ""
     end
-
-    # Restore blocking mode
-    ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, old_flags)
-
-    return String(take!(result))
+    return ""
 end
 
 """
@@ -382,7 +453,11 @@ Close the PTY session and clean up resources.
 function Base.close(session::PtySession)
     # Close the file descriptor first (this will cause the process to terminate)
     if session.master_fd >= 0
-        ccall(:close, Cint, (Cint,), session.master_fd)
+        try
+            io = fdio(session.master_fd, false)
+            close(io)
+        catch
+        end
         session.master_fd = -1
     end
 
