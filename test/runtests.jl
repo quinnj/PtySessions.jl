@@ -7,6 +7,14 @@ using PtySessions
 println("Running PtySessions tests...")
 
 @testset "PtySessions.jl" begin
+    @testset "Portable errno handling" begin
+        @test PtySessions._would_block(Base.Libc.EAGAIN)
+        if isdefined(Base.Libc, :EWOULDBLOCK)
+            @test PtySessions._would_block(getfield(Base.Libc, :EWOULDBLOCK))
+        end
+        @test !PtySessions._would_block(Base.Libc.EINTR)
+    end
+
     @testset "Basic functionality" begin
         # Test 1: Creation and basic I/O
         session = PtySession(`cat`)
