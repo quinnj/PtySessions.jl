@@ -29,6 +29,15 @@ const DEFAULT_READAVAILABLE_MAX_BYTES = 64 * 1024
 const DEFAULT_WRITE_TIMEOUT_S = 1.0
 const POLLIN = Int16(0x0001)
 const POLLHUP = Int16(0x0010)
+const ERRNO_EWOULDBLOCK = if isdefined(Libc, :EWOULDBLOCK)
+    getfield(Libc, :EWOULDBLOCK)
+else
+    # Linux exposes EAGAIN but not EWOULDBLOCK through Base.Libc. POSIX permits
+    # both names to identify the same condition.
+    Libc.EAGAIN
+end
+
+@inline _would_block(err) = err == Libc.EAGAIN || err == ERRNO_EWOULDBLOCK
 
 struct PollFd
     fd::Cint
@@ -155,7 +164,7 @@ function Base.write(session::PtySession, data::Union{String, Vector{UInt8}})
 
     if written < 0
         err = Libc.errno()
-        if err == Libc.EAGAIN || err == Libc.EWOULDBLOCK
+        if _would_block(err)
             return write_with_timeout(session, bytes)
         end
         error("Failed to write to PTY: $(Base.Libc.strerror())")
@@ -216,7 +225,7 @@ function write_with_timeout(session::PtySession, data::Union{String, Vector{UInt
                 err = Libc.errno()
                 if err == Libc.EINTR
                     continue
-                elseif err == Libc.EAGAIN || err == Libc.EWOULDBLOCK
+                elseif _would_block(err)
                     time() >= deadline && break
                 else
                     error("Failed to write to PTY: $(Base.Libc.strerror())")
@@ -341,7 +350,7 @@ function readavailable(session::PtySession; max_bytes::Integer=DEFAULT_READAVAIL
     end
 
     err = Libc.errno()
-    if err == Libc.EINTR || err == Libc.EAGAIN || err == Libc.EWOULDBLOCK
+    if err == Libc.EINTR || _would_block(err)
         return ""
     end
     return ""
