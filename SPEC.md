@@ -35,7 +35,7 @@ the master side as a standard Julia `IO`.
 ### 4. Session Management
 - `isactive(session)` (alias of `process_running`), `process_exited`
 - `wait(session)`, `success(session)`, `exitcode(session)`
-- `kill(session, signum=SIGTERM)`
+- `kill(session, signum=SIGTERM)` signals the session's private process group
 - `getpid(session)` (extends `Base.getpid`)
 - `close(session; force=false)`: closes the master; `force=true` also SIGKILLs
 

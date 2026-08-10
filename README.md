@@ -96,10 +96,11 @@ Terminal control:
 - **No controlling terminal**: the child runs in its own session (`setsid`),
   but libuv provides no way to make the pty its *controlling* terminal.
   Consequences: writing control characters like `"\x03"` does not deliver
-  SIGINT (use `kill(session, Base.SIGINT)`), the kernel does not send SIGHUP
-  when the master closes (most programs still exit on the EOF they see), and
-  job-control shells print a "no job control" warning. This matches the
-  fake-pty approach Julia's own test suite uses.
+  SIGINT (use `kill(session, Base.SIGINT)` to signal the session process
+  group), the kernel does not send SIGHUP when the master closes (most programs
+  still exit on the EOF they see), and job-control shells print a "no job
+  control" warning. This matches the fake-pty approach Julia's own test suite
+  uses.
 - **Hangup on close**: `close(session)` closes the master; children reading
   their terminal observe the hangup (EOF on macOS/BSD, `EIO` on Linux) and
   typically exit — `wait(session)` then reaps. Reads from the session side

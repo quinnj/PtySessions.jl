@@ -95,7 +95,7 @@ terminal (`isatty` is true).
   endings in the output are CRLF (`"\\r\\n"`).
 - The child has no *controlling* terminal (libuv provides no `TIOCSCTTY`), so
   control characters written to the session (e.g. `"\\x03"`) do not generate
-  signals; use `kill(session, sig)` to signal the child directly.
+  signals; use `kill(session, sig)` to signal the session's process group.
 
 # Example
 ```julia
@@ -531,13 +531,13 @@ Call `wait(session)` afterwards to reap the process. With `force=true`, also
 send `SIGKILL` to the child if it is still running.
 """
 function Base.close(s::PtySession; force::Bool=false)
+    force && isactive(s) && kill(s, Base.SIGKILL)
     lock(s.fd_lock)
     try
         close(s.master)
     finally
         unlock(s.fd_lock)
     end
-    force && isactive(s) && kill(s.process, Base.SIGKILL)
     return nothing
 end
 
@@ -560,10 +560,23 @@ Base.wait(s::PtySession) = wait(s.process)
 """
     kill(session::PtySession, signum=Base.SIGTERM)
 
-Send the signal `signum` to the session's child process. No-op if the process
-has already exited.
+Send the signal `signum` to the session's private process group, including
+descendants that remain in that group. No-op if the session leader has already
+exited.
 """
-Base.kill(s::PtySession, signum::Integer=Base.SIGTERM) = kill(s.process, signum)
+function Base.kill(s::PtySession, signum::Integer=Base.SIGTERM)
+    Base.process_running(s.process) || return nothing
+    pid = try
+        getpid(s.process)
+    catch
+        return nothing
+    end
+    ret = ccall(:kill, Cint, (Cint, Cint), -Cint(pid), Cint(signum))
+    ret == 0 && return nothing
+    err = Base.Libc.errno()
+    err == Base.Libc.ESRCH && return nothing
+    Base.systemerror("kill(process group)", err)
+end
 
 """
     getpid(session::PtySession) -> Int
@@ -659,7 +672,7 @@ function Base.resize!(s::PtySession, rows::Integer, cols::Integer)
         _set_winsize(fd, rows, cols)
     end
     # The child has no controlling terminal, so the kernel won't deliver
-    # SIGWINCH on our behalf; notify it directly.
+    # SIGWINCH on our behalf; notify its process group directly.
     isactive(s) && kill(s, SIGWINCH)
     return s
 end

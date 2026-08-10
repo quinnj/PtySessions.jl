@@ -302,6 +302,23 @@ end
     @test getsize(s) == (31, 81)
     close(s; force=true)
     wait(s)
+
+    # A terminal signal targets the foreground process group, not only a shell
+    # that happens to be the session leader. Keep the shell waiting after an
+    # interrupted wait so its descendant can report the group signal.
+    script = raw"""
+        trap : 28
+        sh -c 'trap "echo DESCENDANT_WINCH" 28; echo DESCENDANT_READY; while :; do sleep 1; done' &
+        child=$!
+        while kill -0 "$child" 2>/dev/null; do wait "$child"; done
+        """
+    s = PtySession(`sh -c $script`; echo=false)
+    expect(s, "DESCENDANT_READY"; timeout=15)
+    resize!(s, 32, 82)
+    @test occursin("DESCENDANT_WINCH",
+                   expect(s, "DESCENDANT_WINCH"; timeout=15))
+    close(s; force=true)
+    wait(s)
 end
 
 @testset "status accessors and show" begin
