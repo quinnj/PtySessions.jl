@@ -56,6 +56,8 @@ mutable struct PtySession <: IO
     const pending::PendingBuffer
     # in-flight `eof` waiter task, reused across expect calls that time out
     reader::Union{Task, Nothing}
+    # keeps close from releasing and reusing the fd during ioctl/termios calls
+    const fd_lock::ReentrantLock
 end
 
 # ptsname(3) returns a pointer to static storage; serialize pty allocation so
@@ -173,7 +175,7 @@ function PtySession(cmd::Cmd; env=nothing, dir=nothing,
     # child exits, reads on the master see EOF.
     ccall(:close, Cint, (Cint,), slave_fd)
 
-    return PtySession(process, master, cmd, PipeBuffer(), nothing)
+    return PtySession(process, master, cmd, PipeBuffer(), nothing, ReentrantLock())
 end
 
 """
@@ -207,15 +209,21 @@ function PtySession(f::Function, cmd::Cmd; kwargs...)
     end
 end
 
-# Raw fd of the master, for ioctls. Only valid while the session is open.
-function _master_fd(s::PtySession)
-    handle = s.master.handle
-    (isopen(s.master) && handle != C_NULL) ||
-        throw(Base.IOError("PtySession is closed", 0))
-    fd = Ref{Cint}(-1)
-    err = ccall(:uv_fileno, Cint, (Ptr{Cvoid}, Ptr{Cint}), handle, fd)
-    err == 0 || throw(Base.IOError("PtySession is closed", err))
-    return fd[]
+# Run `f` with the raw master fd while preventing close/fd reuse. The fd must
+# not escape the callback.
+function _with_master_fd(f::F, s::PtySession) where {F}
+    lock(s.fd_lock)
+    try
+        handle = s.master.handle
+        (isopen(s.master) && handle != C_NULL) ||
+            throw(Base.IOError("PtySession is closed", 0))
+        fd = Ref{Cint}(-1)
+        err = ccall(:uv_fileno, Cint, (Ptr{Cvoid}, Ptr{Cint}), handle, fd)
+        err == 0 || throw(Base.IOError("PtySession is closed", err))
+        return f(fd[])
+    finally
+        unlock(s.fd_lock)
+    end
 end
 
 # ── IO interface ────────────────────────────────────────────────────────────
@@ -449,7 +457,12 @@ Call `wait(session)` afterwards to reap the process. With `force=true`, also
 send `SIGKILL` to the child if it is still running.
 """
 function Base.close(s::PtySession; force::Bool=false)
-    close(s.master)
+    lock(s.fd_lock)
+    try
+        close(s.master)
+    finally
+        unlock(s.fd_lock)
+    end
     force && isactive(s) && kill(s.process, Base.SIGKILL)
     return nothing
 end
@@ -568,7 +581,9 @@ observe the new size (e.g. via `TIOCGWINSZ`, `stty size`, or
 `\$LINES`/`\$COLUMNS` updates in shells).
 """
 function Base.resize!(s::PtySession, rows::Integer, cols::Integer)
-    _set_winsize(_master_fd(s), rows, cols)
+    _with_master_fd(s) do fd
+        _set_winsize(fd, rows, cols)
+    end
     # The child has no controlling terminal, so the kernel won't deliver
     # SIGWINCH on our behalf; notify it directly.
     isactive(s) && kill(s, SIGWINCH)
@@ -582,8 +597,10 @@ Return the pty's current window size.
 """
 function getsize(s::PtySession)
     ws = Ref(WinSize(0, 0, 0, 0))
-    ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{WinSize}...), _master_fd(s), TIOCGWINSZ, ws)
-    Base.systemerror("ioctl(TIOCGWINSZ)", ret != 0)
+    _with_master_fd(s) do fd
+        ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{WinSize}...), fd, TIOCGWINSZ, ws)
+        Base.systemerror("ioctl(TIOCGWINSZ)", ret != 0)
+    end
     return (Int(ws[].ws_row), Int(ws[].ws_col))
 end
 
@@ -631,7 +648,9 @@ interaction. See also the `echo` keyword of [`PtySession`](@ref) to configure
 this before the child starts.
 """
 function setecho(s::PtySession, on::Bool)
-    _set_echo(_master_fd(s), on)
+    _with_master_fd(s) do fd
+        _set_echo(fd, on)
+    end
     return nothing
 end
 
@@ -640,6 +659,8 @@ end
 
 Return whether the pty currently echoes input.
 """
-getecho(s::PtySession) = (_get_lflag(_master_fd(s))[1] & ECHO_FLAG) != 0
+getecho(s::PtySession) = _with_master_fd(s) do fd
+    (_get_lflag(fd)[1] & ECHO_FLAG) != 0
+end
 
 end # module PtySessions

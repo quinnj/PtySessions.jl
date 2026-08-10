@@ -19,7 +19,9 @@ end
 
     # The master must be close-on-exec from the instant it is allocated. This
     # keeps unrelated children spawned by other threads from inheriting it.
-    master_flags = ccall(:fcntl, Cint, (Cint, Cint), PtySessions._master_fd(s), Cint(1))
+    master_flags = PtySessions._with_master_fd(s) do fd
+        ccall(:fcntl, Cint, (Cint, Cint), fd, Cint(1))
+    end
     @test master_flags >= 0
     @test master_flags & 1 == 1
 
@@ -34,6 +36,25 @@ end
     @test !isopen(s)
     wait(s)          # cat sees EOF once the master closes and exits
     @test !isactive(s)
+end
+
+@testset "terminal operations serialize with close" begin
+    s = PtySession(`cat`)
+    entered = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    holder = @async PtySessions._with_master_fd(s) do _
+        put!(entered, nothing)
+        take!(release)
+    end
+    take!(entered)
+    closer = @async close(s; force=true)
+    yield()
+    @test !istaskdone(closer)
+    put!(release, nothing)
+    wait(holder)
+    wait(closer)
+    wait(s)
+    @test !isopen(s)
 end
 
 @testset "UTF-8 round trip" begin
