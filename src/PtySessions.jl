@@ -109,34 +109,35 @@ function PtySession(cmd::Cmd; env=nothing, dir=nothing,
 
     O_RDWR = Base.Filesystem.JL_O_RDWR
     O_NOCTTY = Base.Filesystem.JL_O_NOCTTY
+    O_CLOEXEC = Base.Filesystem.JL_O_CLOEXEC
 
     # Allocate the pty pair. O_NOCTTY on the slave open matters: without it, a
     # session-leader Julia process without a controlling terminal would acquire
-    # this pty as its controlling terminal as a side effect.
+    # this pty as its controlling terminal as a side effect. CLOEXEC keeps the
+    # pty fds out of unrelated child processes spawned concurrently elsewhere;
+    # our child receives its stdio copies via dup2, which clears CLOEXEC on the
+    # duplicates. posix_openpt has no portable O_CLOEXEC, so the master gets it
+    # via fcntl immediately after allocation (still inside the lock, before any
+    # concurrent spawn can run).
+    F_SETFD, FD_CLOEXEC = Cint(2), Cint(1)
     local master_fd::Cint, slave_fd::Cint
     lock(PTY_ALLOC_LOCK) do
         master_fd = ccall(:posix_openpt, Cint, (Cint,), O_RDWR | O_NOCTTY)
         Base.systemerror("posix_openpt", master_fd < 0)
         try
+            ccall(:fcntl, Cint, (Cint, Cint, Cint), master_fd, F_SETFD, FD_CLOEXEC)
             Base.systemerror("grantpt", ccall(:grantpt, Cint, (Cint,), master_fd) != 0)
             Base.systemerror("unlockpt", ccall(:unlockpt, Cint, (Cint,), master_fd) != 0)
             name_ptr = ccall(:ptsname, Ptr{UInt8}, (Cint,), master_fd)
             Base.systemerror("ptsname", name_ptr == C_NULL)
             slave_name = unsafe_string(name_ptr)
-            slave_fd = ccall(:open, Cint, (Cstring, Cint), slave_name, O_RDWR | O_NOCTTY)
+            slave_fd = ccall(:open, Cint, (Cstring, Cint), slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC)
             Base.systemerror("open($slave_name)", slave_fd < 0)
         catch
             ccall(:close, Cint, (Cint,), master_fd)
             rethrow()
         end
     end
-
-    # Keep the pty fds out of unrelated child processes spawned concurrently
-    # elsewhere; our child receives its stdio copies via dup2, which clears
-    # CLOEXEC on the duplicates.
-    F_SETFD, FD_CLOEXEC = Cint(2), Cint(1)
-    ccall(:fcntl, Cint, (Cint, Cint, Cint), master_fd, F_SETFD, FD_CLOEXEC)
-    ccall(:fcntl, Cint, (Cint, Cint, Cint), slave_fd, F_SETFD, FD_CLOEXEC)
 
     # Configure the terminal before the child starts, so it observes the
     # requested size and echo mode from its very first read.
@@ -210,9 +211,11 @@ end
 
 # Raw fd of the master, for ioctls. Only valid while the session is open.
 function _master_fd(s::PtySession)
-    isopen(s.master) || throw(Base.IOError("PtySession is closed", 0))
+    handle = s.master.handle
+    (isopen(s.master) && handle != C_NULL) ||
+        throw(Base.IOError("PtySession is closed", 0))
     fd = Ref{Cint}(-1)
-    err = ccall(:uv_fileno, Cint, (Ptr{Cvoid}, Ptr{Cint}), s.master.handle, fd)
+    err = ccall(:uv_fileno, Cint, (Ptr{Cvoid}, Ptr{Cint}), handle, fd)
     err == 0 || throw(Base.IOError("PtySession is closed", err))
     return fd[]
 end
@@ -277,13 +280,20 @@ Base.showerror(io::IO, e::ExpectTimeoutError) =
 
 const DEFAULT_EXPECT_TIMEOUT = 30.0
 
-# Byte index in `data` of the end of the first match, or nothing.
-function _match_end(pattern::AbstractString, data::Vector{UInt8})
-    r = findfirst(codeunits(String(pattern)), data)
+# Byte index in `data` of the end of the first match, or nothing. `searched` is
+# how many leading bytes a previous call already established contain no match:
+# a fixed string absent from data[1:searched] can only match starting within
+# its last patlen-1 bytes, so resume there instead of rescanning from the top
+# (keeps expect linear as output accumulates). A regex match can start anywhere
+# once new bytes arrive (e.g. r"a.*b"), so regexes always rescan in full.
+function _match_end(pattern::AbstractString, data::Vector{UInt8}, searched::Int)
+    pat = codeunits(String(pattern))
+    start = max(1, searched - length(pat) + 2)
+    r = findnext(pat, data, start)
     return r === nothing ? nothing : last(r)
 end
 
-function _match_end(pattern::Regex, data::Vector{UInt8})
+function _match_end(pattern::Regex, data::Vector{UInt8}, searched::Int)
     str = String(copy(data))
     m = match(pattern, str)
     m === nothing && return nothing
@@ -313,7 +323,13 @@ function _wait_input(s::PtySession, deadline::Float64)
     remaining = min(deadline - time(), 3600.0)  # timedwait needs a finite timeout
     remaining <= 0 && return :timeout
     timedwait(() -> istaskdone(t), remaining; pollint=0.01) === :timed_out && return :timeout
-    return (fetch(t)::Bool) ? :eof : :data
+    # a failed waiter means the stream was torn down under us: treat as EOF
+    done = try
+        fetch(t)::Bool
+    catch
+        true
+    end
+    return done ? :eof : :data
 end
 
 """
@@ -342,14 +358,16 @@ function expect(s::PtySession, pattern::Union{AbstractString, Regex};
         throw(ArgumentError("pattern must be non-empty"))
     deadline = time() + timeout
     saw_eof = false
+    searched = 0
     while true
         _drain!(s)
         data = read(s.pending)
-        stop = _match_end(pattern, data)
+        stop = _match_end(pattern, data, searched)
         if stop !== nothing
             write(s.pending, @view data[stop+1:end])
             return String(data[1:stop])
         end
+        searched = length(data)
         write(s.pending, data)
         saw_eof && throw(EOFError())
         status = _wait_input(s, deadline)

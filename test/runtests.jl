@@ -198,6 +198,29 @@ end
     wait(s)
 end
 
+@testset "expect matches across chunk boundaries" begin
+    # the marker arrives split across two writes while expect is waiting, so
+    # the resumed (incremental) search must still see it straddle the boundary
+    s = PtySession(`cat`; echo=false)
+    writer = @async begin
+        write(s, "ABC\n")
+        sleep(0.3)
+        write(s, "DEF\n")
+    end
+    out = expect(s, "\nDEF"; timeout=15)
+    @test endswith(out, "\nDEF")
+    wait(writer)
+    close(s; force=true)
+    wait(s)
+
+    # incremental-search seam: a resumed search must back up far enough to
+    # catch a match overlapping the already-searched prefix
+    data = Vector{UInt8}("hello world")
+    @test PtySessions._match_end("world", data, 6) == 11
+    @test PtySessions._match_end("o w", data, 6) == 7
+    @test PtySessions._match_end("xyz", data, 6) === nothing
+end
+
 @testset "expect hits EOF" begin
     s = PtySession(`sh -c "echo partial-output"`; echo=false)
     @test_throws EOFError expect(s, "no-such-marker"; timeout=15)
