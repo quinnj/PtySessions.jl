@@ -528,7 +528,7 @@ Close the master side of the pty. Children that read their terminal observe
 the hangup (end-of-file on macOS/BSD, `EIO` on Linux) and typically exit on
 their own — though their exit status after a hangup is platform-dependent.
 Call `wait(session)` afterwards to reap the process. With `force=true`, also
-send `SIGKILL` to the child if it is still running.
+send `SIGKILL` to the session process group if its leader is still running.
 """
 function Base.close(s::PtySession; force::Bool=false)
     force && isactive(s) && kill(s, Base.SIGKILL)

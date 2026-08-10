@@ -78,7 +78,7 @@ Process management:
 - `PtySessions.isactive(session)` / `process_running` / `process_exited`
 - `wait(session)`, `success(session)`, `PtySessions.exitcode(session)`, `getpid(session)`
 - `kill(session, signum=SIGTERM)`
-- `close(session; force=false)` — closes the pty; `force=true` also SIGKILLs
+- `close(session; force=false)` — closes the pty; `force=true` also SIGKILLs the process group
 
 Terminal control:
 

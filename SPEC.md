@@ -38,6 +38,7 @@ the master side as a standard Julia `IO`.
 - `kill(session, signum=SIGTERM)` signals the session's private process group
 - `getpid(session)` (extends `Base.getpid`)
 - `close(session; force=false)`: closes the master; `force=true` also SIGKILLs
+  the session process group
 
 ### 5. Terminal Control
 - `resize!(session, rows, cols)`: set window size, deliver SIGWINCH
