@@ -221,9 +221,10 @@ end
 
     # timeout raises promptly and doesn't lose buffered data
     write(s, "leftover\n")
-    start = time()
-    @test_throws ExpectTimeoutError expect(s, "never-appears-4dc1"; timeout=0.5)
-    @test time() - start < 10
+    elapsed = @elapsed begin
+        @test_throws ExpectTimeoutError expect(s, "never-appears-4dc1"; timeout=0.5)
+    end
+    @test elapsed < 10
     @test occursin("leftover", String(readavailable(s)))
 
     # Repeated timeouts reuse one reader task. Late timer events must not make
