@@ -442,6 +442,7 @@ ends before `delim` appears; throws [`ExpectTimeoutError`](@ref) on timeout.
 """
 function Base.readuntil(s::PtySession, delim::AbstractString;
                         keep::Bool=false, timeout::Real=Inf)
+    isempty(delim) && return ""
     matched = try
         expect(s, delim; timeout=timeout)
     catch e

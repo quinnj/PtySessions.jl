@@ -76,6 +76,8 @@ end
     @test !occursin("MARKER", out)
     out = readuntil(s, "MARKER"; keep=true)
     @test endswith(out, "MARKER")
+    @test readuntil(s, "") == ""
+    @test readuntil(s, ""; keep=true, timeout=0) == ""
     close(s)
     wait(s)
 end
