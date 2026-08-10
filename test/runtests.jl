@@ -119,6 +119,55 @@ end
     close(s)
 end
 
+@testset "status accessors and show" begin
+    s = PtySession(`sh -c "exit 3"`)
+    wait(s)
+    @test process_exited(s)
+    @test !process_running(s)
+    @test exitcode(s) == 3
+    @test !success(s)
+    @test occursin("exited, code=3", sprint(show, s))
+    close(s)
+    @test occursin("closed", sprint(show, s))
+
+    s = PtySession(`cat`)
+    @test process_running(s)
+    @test_throws ArgumentError exitcode(s)
+    shown = sprint(show, s)
+    @test occursin("running, pid=", shown)
+    @test occursin("cat", shown)
+    close(s)
+    @test success(s)     # cat exits 0 on EOF; success waits for it
+    @test exitcode(s) == 0
+end
+
+@testset "do-block constructor" begin
+    # child that exits on EOF: cleaned up via the graceful path
+    result = PtySession(`cat`) do s
+        write(s, "scoped\n")
+        readline(s)
+    end
+    @test occursin("scoped", result)
+
+    # child that ignores EOF: cleaned up via the SIGKILL grace timer
+    local captured
+    elapsed = @elapsed PtySession(`sleep 100`) do s
+        captured = s
+    end
+    @test !isactive(captured)
+    @test !isopen(captured)
+    @test elapsed < 30
+
+    # f's exception propagates and cleanup still happens
+    local captured2
+    @test_throws ErrorException PtySession(`cat`) do s
+        captured2 = s
+        error("boom")
+    end
+    @test !isactive(captured2)
+    @test !isopen(captured2)
+end
+
 @testset "close(force=true) kills stubborn children" begin
     # sleep never reads its terminal, so EOF alone wouldn't stop it
     s = PtySession(`sleep 100`)

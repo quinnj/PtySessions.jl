@@ -21,7 +21,7 @@ wait(session)
 """
 module PtySessions
 
-export PtySession, isactive, getsize
+export PtySession, isactive, exitcode, getsize
 
 # The pty line discipline needs a signal we can't get from Base; value is 28 on
 # both Linux and macOS.
@@ -149,6 +149,37 @@ function PtySession(cmd::Cmd; env=nothing, dir=nothing)
     return PtySession(process, master, cmd)
 end
 
+"""
+    PtySession(f::Function, cmd::Cmd; kwargs...)
+
+Run `f(session)` with a fresh [`PtySession`](@ref), guaranteeing cleanup: when
+`f` returns (or throws), the master side is closed, the child is given a grace
+period of `2` seconds to exit on its own (most terminal programs exit on EOF),
+then force-killed if necessary, and finally reaped. Returns `f`'s return value.
+
+```julia
+output = PtySession(`cat`) do session
+    write(session, "hi\\n")
+    readline(session)
+end
+```
+"""
+function PtySession(f::Function, cmd::Cmd; kwargs...)
+    session = PtySession(cmd; kwargs...)
+    try
+        return f(session)
+    finally
+        close(session)
+        if isactive(session)
+            grace = Timer(2.0) do _
+                isactive(session) && kill(session, Base.SIGKILL)
+            end
+            wait(session)
+            close(grace)
+        end
+    end
+end
+
 # Raw fd of the master, for ioctls. Only valid while the session is open.
 function _master_fd(s::PtySession)
     isopen(s.master) || throw(Base.IOError("PtySession is closed", 0))
@@ -217,6 +248,50 @@ Return the OS process ID of the session's child process. Throws if the process
 has already exited.
 """
 Base.getpid(s::PtySession) = getpid(s.process)
+
+"""
+    process_running(session::PtySession) -> Bool
+    process_exited(session::PtySession) -> Bool
+
+Whether the session's child process is still running / has exited.
+`process_running` is the same as [`isactive`](@ref).
+"""
+Base.process_running(s::PtySession) = Base.process_running(s.process)
+Base.process_exited(s::PtySession) = Base.process_exited(s.process)
+
+"""
+    success(session::PtySession) -> Bool
+
+Wait for the session's child process to exit and return `true` if it exited
+with status 0 and was not killed by a signal.
+"""
+Base.success(s::PtySession) = success(s.process)
+
+"""
+    exitcode(session::PtySession) -> Int
+
+Exit status of the session's child process. Throws if the process is still
+running. Note that for a child killed by a signal, see
+`Base.process_signaled`/`s.process.termsignal`.
+"""
+function exitcode(s::PtySession)
+    Base.process_exited(s.process) ||
+        throw(ArgumentError("process has not exited; call wait(session) first"))
+    return Int(s.process.exitcode)
+end
+
+function Base.show(io::IO, s::PtySession)
+    print(io, "PtySession(", s.cmd, ", ")
+    if Base.process_running(s.process)
+        print(io, "running, pid=", getpid(s))
+    elseif Base.process_exited(s.process)
+        print(io, "exited, code=", s.process.exitcode)
+    else
+        print(io, "not started")
+    end
+    isopen(s) || print(io, ", closed")
+    print(io, ")")
+end
 
 # ── Terminal size ───────────────────────────────────────────────────────────
 
