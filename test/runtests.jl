@@ -253,6 +253,7 @@ end
     # catch a match overlapping the already-searched prefix
     data = Vector{UInt8}("hello world")
     @test PtySessions._match_end("world", data, 6) == 11
+    @test PtySessions._match_end(Vector{UInt8}("world"), data, 6) == 11
     @test PtySessions._match_end("o w", data, 6) == 7
     @test PtySessions._match_end("xyz", data, 6) === nothing
 end

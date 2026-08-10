@@ -326,12 +326,14 @@ const DEFAULT_EXPECT_TIMEOUT = 30.0
 # its last patlen-1 bytes, so resume there instead of rescanning from the top
 # (keeps expect linear as output accumulates). A regex match can start anywhere
 # once new bytes arrive (e.g. r"a.*b"), so regexes always rescan in full.
-function _match_end(pattern::AbstractString, data::Vector{UInt8}, searched::Int)
-    pat = codeunits(String(pattern))
-    start = max(1, searched - length(pat) + 2)
-    r = findnext(pat, data, start)
+function _match_end(pattern::AbstractVector{UInt8}, data::Vector{UInt8}, searched::Int)
+    start = max(1, searched - length(pattern) + 2)
+    r = findnext(pattern, data, start)
     return r === nothing ? nothing : last(r)
 end
+
+_match_end(pattern::AbstractString, data::Vector{UInt8}, searched::Int) =
+    _match_end(codeunits(String(pattern)), data, searched)
 
 function _match_end(pattern::Regex, data::Vector{UInt8}, searched::Int)
     str = String(copy(data))
@@ -340,10 +342,10 @@ function _match_end(pattern::Regex, data::Vector{UInt8}, searched::Int)
     return m.offset + ncodeunits(m.match) - 1
 end
 
-# Move everything currently readable on the master into the pending buffer.
-function _drain!(s::PtySession)
+# Append everything currently readable on the master to `data`.
+function _drain!(data::Vector{UInt8}, s::PtySession)
     while bytesavailable(s.master) > 0
-        write(s.pending, readavailable(s.master))
+        append!(data, readavailable(s.master))
     end
     return nothing
 end
@@ -410,24 +412,32 @@ function expect(s::PtySession, pattern::Union{AbstractString, Regex};
     started = time_ns()
     saw_eof = false
     searched = 0
-    while true
-        _drain!(s)
-        data = read(s.pending)
-        stop = _match_end(pattern, data, searched)
-        if stop !== nothing
-            write(s.pending, @view data[stop+1:end])
-            return String(data[1:stop])
+    data = read(s.pending)
+    search_pattern = pattern isa Regex ? pattern : collect(codeunits(String(pattern)))
+    try
+        while true
+            _drain!(data, s)
+            stop = _match_end(search_pattern, data, searched)
+            if stop !== nothing
+                output = String(data[1:stop])
+                write(s.pending, @view data[stop+1:end])
+                return output
+            end
+            searched = length(data)
+            saw_eof && throw(EOFError())
+            status = _wait_input(s, started, timeout_s)
+            if status === :timeout
+                throw(ExpectTimeoutError(pattern isa Regex ? pattern : String(pattern),
+                                         timeout_s))
+            elseif status === :eof
+                saw_eof = true
+            end
         end
-        searched = length(data)
+    catch
+        # expect consumes no output when it fails. Restore all accumulated data
+        # once, so ordinary reads or another expect can continue from it.
         write(s.pending, data)
-        saw_eof && throw(EOFError())
-        status = _wait_input(s, started, timeout_s)
-        if status === :timeout
-            throw(ExpectTimeoutError(pattern isa Regex ? pattern : String(pattern),
-                                     timeout_s))
-        elseif status === :eof
-            saw_eof = true
-        end
+        rethrow()
     end
 end
 
