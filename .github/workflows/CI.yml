@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["*"]
   pull_request:
 concurrency:
@@ -10,6 +10,9 @@ concurrency:
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    # skip the duplicate pull_request run for same-repo branches (they already
+    # run via the push trigger); fork PRs only get the pull_request event
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
