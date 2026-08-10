@@ -110,6 +110,49 @@ end
     close(s)
 end
 
+@testset "initial window size" begin
+    s = PtySession(`cat`)
+    @test getsize(s) == (24, 80)      # default, not a confusing 0×0
+    close(s)
+    wait(s)
+
+    # size is in place before the child's first instruction runs
+    s = PtySession(`sh -c "stty size"`; rows=11, cols=42)
+    data = read(s, String)
+    @test occursin("11 42", data)
+    wait(s)
+    close(s)
+end
+
+@testset "echo control" begin
+    # default: echo on — input appears twice (echo + cat's copy)
+    s = PtySession(`cat`)
+    @test getecho(s)
+    write(s, "marker\n\x04")          # \x04 = VEOF at line start: cat exits
+    data = read(s, String)
+    @test count("marker", data) == 2
+    wait(s)
+    close(s)
+
+    # echo=false: input appears exactly once
+    s = PtySession(`cat`; echo=false)
+    @test !getecho(s)
+    write(s, "marker\n\x04")
+    data = read(s, String)
+    @test count("marker", data) == 1
+    wait(s)
+    close(s)
+
+    # toggling at runtime
+    s = PtySession(`cat`; echo=false)
+    setecho(s, true)
+    @test getecho(s)
+    setecho(s, false)
+    @test !getecho(s)
+    close(s; force=true)
+    wait(s)
+end
+
 @testset "process management" begin
     s = PtySession(`cat`)
     @test getpid(s) > 0

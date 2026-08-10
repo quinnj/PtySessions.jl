@@ -21,7 +21,7 @@ wait(session)
 """
 module PtySessions
 
-export PtySession, isactive, exitcode, getsize
+export PtySession, isactive, exitcode, getsize, setecho, getecho
 
 # The pty line discipline needs a signal we can't get from Base; value is 28 on
 # both Linux and macOS.
@@ -52,7 +52,7 @@ end
 const PTY_ALLOC_LOCK = ReentrantLock()
 
 """
-    PtySession(cmd::Cmd; env=nothing, dir=nothing)
+    PtySession(cmd::Cmd; env=nothing, dir=nothing, rows=24, cols=80, echo=true)
 
 Run `cmd` in a fresh pseudo-terminal and return the [`PtySession`](@ref)
 connected to it.
@@ -68,21 +68,27 @@ terminal (`isatty` is true).
   environment — include `"PATH"` if the command needs it.
 - `dir`: working directory for the child. `nothing` (the default) inherits the
   current working directory.
+- `rows`, `cols`: initial window size of the pty, set before the child starts
+  (a fresh pty otherwise reports 0×0, which confuses terminal programs).
+- `echo`: whether the pty's line discipline echoes input back into the output
+  stream (terminal default). Pass `false` for clean scripted interaction where
+  written input should not reappear; see also [`setecho`](@ref).
 
 # Notes
-- The pty's line discipline echoes input back by default, so written input
-  reappears in the session's output with CRLF (`"\\r\\n"`) line endings.
+- With `echo=true`, written input reappears in the session's output, and line
+  endings in the output are CRLF (`"\\r\\n"`).
 - The child has no *controlling* terminal (libuv provides no `TIOCSCTTY`), so
   control characters written to the session (e.g. `"\\x03"`) do not generate
   signals; use `kill(session, sig)` to signal the child directly.
 
 # Example
 ```julia
-session = PtySession(`sh`; dir="/tmp")
+session = PtySession(`sh`; dir="/tmp", echo=false)
 write(session, "echo hello\\n")
 ```
 """
-function PtySession(cmd::Cmd; env=nothing, dir=nothing)
+function PtySession(cmd::Cmd; env=nothing, dir=nothing,
+                    rows::Integer=24, cols::Integer=80, echo::Bool=true)
     (Sys.islinux() || Sys.isapple()) ||
         error("PtySessions requires POSIX pty support and only supports Linux and macOS; got $(Sys.KERNEL)")
 
@@ -120,6 +126,17 @@ function PtySession(cmd::Cmd; env=nothing, dir=nothing)
     F_SETFD, FD_CLOEXEC = Cint(2), Cint(1)
     ccall(:fcntl, Cint, (Cint, Cint, Cint), master_fd, F_SETFD, FD_CLOEXEC)
     ccall(:fcntl, Cint, (Cint, Cint, Cint), slave_fd, F_SETFD, FD_CLOEXEC)
+
+    # Configure the terminal before the child starts, so it observes the
+    # requested size and echo mode from its very first read.
+    try
+        _set_winsize(master_fd, rows, cols)
+        echo || _set_echo(master_fd, false)
+    catch
+        ccall(:close, Cint, (Cint,), master_fd)
+        ccall(:close, Cint, (Cint,), slave_fd)
+        rethrow()
+    end
 
     local master::Base.TTY
     try
@@ -310,20 +327,29 @@ else
     const TIOCSWINSZ = Culong(0x5414)
 end
 
-"""
-    resize!(session::PtySession, rows::Integer, cols::Integer)
-
-Set the pty's window size. The child can observe the new size (e.g. via
-`TIOCGWINSZ`, `stty size`, or `\$LINES`/`\$COLUMNS` updates in shells).
-"""
-function Base.resize!(s::PtySession, rows::Integer, cols::Integer)
+function _set_winsize(fd::Cint, rows::Integer, cols::Integer)
     (0 <= rows <= typemax(UInt16) && 0 <= cols <= typemax(UInt16)) ||
         throw(ArgumentError("rows and cols must be in 0:$(typemax(UInt16)), got ($rows, $cols)"))
     ws = Ref(WinSize(rows, cols, 0, 0))
     # ioctl(2) is variadic; the trailing `...` matters for ABI correctness
     # (on aarch64-darwin, variadic args are passed on the stack).
-    ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{WinSize}...), _master_fd(s), TIOCSWINSZ, ws)
+    ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{WinSize}...), fd, TIOCSWINSZ, ws)
     Base.systemerror("ioctl(TIOCSWINSZ)", ret != 0)
+    return nothing
+end
+
+"""
+    resize!(session::PtySession, rows::Integer, cols::Integer)
+
+Set the pty's window size and notify the child with `SIGWINCH`. The child can
+observe the new size (e.g. via `TIOCGWINSZ`, `stty size`, or
+`\$LINES`/`\$COLUMNS` updates in shells).
+"""
+function Base.resize!(s::PtySession, rows::Integer, cols::Integer)
+    _set_winsize(_master_fd(s), rows, cols)
+    # The child has no controlling terminal, so the kernel won't deliver
+    # SIGWINCH on our behalf; notify it directly.
+    isactive(s) && kill(s, SIGWINCH)
     return s
 end
 
@@ -338,5 +364,60 @@ function getsize(s::PtySession)
     Base.systemerror("ioctl(TIOCGWINSZ)", ret != 0)
     return (Int(ws[].ws_row), Int(ws[].ws_col))
 end
+
+# ── Echo control ────────────────────────────────────────────────────────────
+
+# We only need the c_lflag field of struct termios, whose layout differs per
+# platform: glibc has 32-bit tcflag_t with c_lflag at offset 12 (60-byte
+# struct); Darwin has 64-bit tcflag_t with c_lflag at offset 24 (72-byte
+# struct). ECHO is 0x8 and TCSANOW is 0 on both.
+@static if Sys.isapple()
+    const TERMIOS_SIZE = 72
+    const LFLAG_OFFSET = 24
+    const Tcflag = UInt64
+else
+    const TERMIOS_SIZE = 60
+    const LFLAG_OFFSET = 12
+    const Tcflag = UInt32
+end
+const ECHO_FLAG = Tcflag(0x8)
+const TCSANOW = Cint(0)
+
+function _get_lflag(fd::Cint)
+    buf = zeros(UInt8, TERMIOS_SIZE)
+    ret = ccall(:tcgetattr, Cint, (Cint, Ptr{UInt8}), fd, buf)
+    Base.systemerror("tcgetattr", ret != 0)
+    lflag = GC.@preserve buf unsafe_load(Ptr{Tcflag}(pointer(buf, LFLAG_OFFSET + 1)))
+    return lflag, buf
+end
+
+function _set_echo(fd::Cint, on::Bool)
+    lflag, buf = _get_lflag(fd)
+    lflag = on ? (lflag | ECHO_FLAG) : (lflag & ~ECHO_FLAG)
+    GC.@preserve buf unsafe_store!(Ptr{Tcflag}(pointer(buf, LFLAG_OFFSET + 1)), lflag)
+    ret = ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{UInt8}), fd, TCSANOW, buf)
+    Base.systemerror("tcsetattr", ret != 0)
+    return nothing
+end
+
+"""
+    setecho(session::PtySession, on::Bool)
+
+Enable or disable the pty's input echo. With echo off, data written to the
+session no longer reappears in its output — usually what you want for scripted
+interaction. See also the `echo` keyword of [`PtySession`](@ref) to configure
+this before the child starts.
+"""
+function setecho(s::PtySession, on::Bool)
+    _set_echo(_master_fd(s), on)
+    return nothing
+end
+
+"""
+    getecho(session::PtySession) -> Bool
+
+Return whether the pty currently echoes input.
+"""
+getecho(s::PtySession) = (_get_lflag(_master_fd(s))[1] & ECHO_FLAG) != 0
 
 end # module PtySessions
