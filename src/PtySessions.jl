@@ -368,15 +368,19 @@ function _start_reader!(s::PtySession)
     stream = s.master
     events = s.reader_events
     task = @async begin
-        status = try
-            _eof(stream) ? :eof : :data
-        catch
-            # Concurrent close tears down a waiter. Match the read-side EOF
-            # semantics used elsewhere instead of exposing TaskFailedException.
-            :eof
+        status, exception = try
+            (_eof(stream) ? :eof : :data), nothing
+        catch e
+            if !isopen(stream)
+                # Concurrent close tears down a waiter. Match the read-side EOF
+                # semantics used elsewhere instead of exposing an internal error.
+                :eof, nothing
+            else
+                :error, e
+            end
         end
         put!(events, (generation, 0, status))
-        return status
+        return status, exception
     end
     s.reader = task
     return task, generation
@@ -384,7 +388,9 @@ end
 
 function _finish_reader!(s::PtySession, task::Task)
     s.reader === task && (s.reader = nothing)
-    return fetch(task)::Symbol
+    status, exception = fetch(task)
+    status === :error && throw(exception)
+    return status::Symbol
 end
 
 function _wait_input(s::PtySession, started::UInt64, timeout::Float64)
@@ -416,7 +422,7 @@ function _wait_input(s::PtySession, started::UInt64, timeout::Float64)
             while true
                 event_reader, event_wait, status = take!(s.reader_events)
                 event_reader == reader_generation || continue
-                if status === :data || status === :eof
+                if status === :data || status === :eof || status === :error
                     return _finish_reader!(s, t)
                 end
                 event_wait == wait_generation || continue

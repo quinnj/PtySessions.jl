@@ -249,6 +249,15 @@ end
                                          UInt64(1_000_000_100)) == 1.0
     close(s; force=true)
     wait(s)
+
+    # Unexpected reader failures must not be misreported as normal EOF.
+    s = PtySession(`cat`; echo=false)
+    reader_error = ErrorException("reader failed")
+    s.reader = @async (:error, reader_error)
+    wait(s.reader)
+    @test_throws ErrorException PtySessions._wait_input(s, time_ns(), 5.0)
+    close(s; force=true)
+    wait(s)
 end
 
 @testset "expect matches across chunk boundaries" begin
