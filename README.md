@@ -1,6 +1,6 @@
 # PtySessions.jl
 
-[![CI](https://github.com/quinnj/PtySessions.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/quinnj/PtySessions.jl/actions/workflows/CI.yml)
+[![CI](https://github.com/JuliaServices/PtySessions.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/JuliaServices/PtySessions.jl/actions/workflows/CI.yml)
 
 Run commands in pseudo-terminal (PTY) sessions from Julia and interact with
 them programmatically — the moral equivalent of Python's
