@@ -17,6 +17,12 @@ end
     @test isreadable(s)
     @test iswritable(s)
 
+    # The master must be close-on-exec from the instant it is allocated. This
+    # keeps unrelated children spawned by other threads from inheriting it.
+    master_flags = ccall(:fcntl, Cint, (Cint, Cint), PtySessions._master_fd(s), Cint(1))
+    @test master_flags >= 0
+    @test master_flags & 1 == 1
+
     write(s, "hello\n")
     # The pty echoes input by default (with CRLF), then cat's copy follows.
     echoed = readline(s)

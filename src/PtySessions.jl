@@ -116,16 +116,14 @@ function PtySession(cmd::Cmd; env=nothing, dir=nothing,
     # this pty as its controlling terminal as a side effect. CLOEXEC keeps the
     # pty fds out of unrelated child processes spawned concurrently elsewhere;
     # our child receives its stdio copies via dup2, which clears CLOEXEC on the
-    # duplicates. posix_openpt has no portable O_CLOEXEC, so the master gets it
-    # via fcntl immediately after allocation (still inside the lock, before any
-    # concurrent spawn can run).
-    F_SETFD, FD_CLOEXEC = Cint(2), Cint(1)
+    # duplicates. Linux and macOS both accept O_CLOEXEC in posix_openpt, so set
+    # it atomically at allocation time. A later fcntl would race unrelated
+    # fork/exec activity in another thread.
     local master_fd::Cint, slave_fd::Cint
     lock(PTY_ALLOC_LOCK) do
-        master_fd = ccall(:posix_openpt, Cint, (Cint,), O_RDWR | O_NOCTTY)
+        master_fd = ccall(:posix_openpt, Cint, (Cint,), O_RDWR | O_NOCTTY | O_CLOEXEC)
         Base.systemerror("posix_openpt", master_fd < 0)
         try
-            ccall(:fcntl, Cint, (Cint, Cint, Cint), master_fd, F_SETFD, FD_CLOEXEC)
             Base.systemerror("grantpt", ccall(:grantpt, Cint, (Cint,), master_fd) != 0)
             Base.systemerror("unlockpt", ccall(:unlockpt, Cint, (Cint,), master_fd) != 0)
             name_ptr = ccall(:ptsname, Ptr{UInt8}, (Cint,), master_fd)
