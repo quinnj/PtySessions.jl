@@ -162,6 +162,72 @@ end
     close(s)
 end
 
+@testset "expect" begin
+    s = PtySession(`cat`; echo=false)
+    write(s, "one\ntwo\nthree\n")
+    out = expect(s, "two"; timeout=15)
+    @test endswith(out, "two")
+    @test occursin("one", out)
+    # data after the match stays buffered for subsequent reads
+    @test bytesavailable(s) > 0 || occursin("three", readuntil(s, "three"; keep=true, timeout=15))
+
+    # regex pattern
+    write(s, "code=1234 done\n")
+    out = expect(s, r"code=\d+"; timeout=15)
+    @test endswith(out, "code=1234")
+
+    # print/println integrate via the IO interface
+    println(s, "printed")
+    @test occursin("printed", expect(s, "printed"; timeout=15))
+
+    # timeout raises promptly and doesn't lose buffered data
+    write(s, "leftover\n")
+    start = time()
+    @test_throws ExpectTimeoutError expect(s, "never-appears-4dc1"; timeout=0.5)
+    @test time() - start < 10
+    @test occursin("leftover", String(readavailable(s)))
+
+    @test_throws ArgumentError expect(s, ""; timeout=5)
+    @test_throws ArgumentError expect(s, "x"; timeout=0)
+    close(s; force=true)
+    wait(s)
+end
+
+@testset "expect hits EOF" begin
+    s = PtySession(`sh -c "echo partial-output"`; echo=false)
+    @test_throws EOFError expect(s, "no-such-marker"; timeout=15)
+    # consumed output remains readable after the failed expect
+    @test occursin("partial-output", String(readavailable(s)))
+    wait(s)
+    close(s)
+end
+
+@testset "readuntil with timeout" begin
+    s = PtySession(`cat`; echo=false)
+    write(s, "alpha;beta\n")
+    @test readuntil(s, ";"; timeout=15) == "alpha"
+    @test_throws ExpectTimeoutError readuntil(s, ";"; timeout=0.5)
+    close(s; force=true)
+    wait(s)
+
+    # EOF before the delimiter returns partial data (Base semantics)
+    s = PtySession(`sh -c "printf 'no-delimiter-here'"`; echo=false)
+    @test readuntil(s, "ZZZ"; timeout=15) == "no-delimiter-here"
+    wait(s)
+    close(s)
+end
+
+@testset "resize! delivers SIGWINCH" begin
+    s = PtySession(`sh -c "trap 'echo GOTWINCH' 28; echo READY; while :; do sleep 0.2; done"`;
+                   echo=false)
+    expect(s, "READY"; timeout=15)   # trap is installed before READY prints
+    resize!(s, 31, 81)
+    @test occursin("GOTWINCH", expect(s, "GOTWINCH"; timeout=15))
+    @test getsize(s) == (31, 81)
+    close(s; force=true)
+    wait(s)
+end
+
 @testset "status accessors and show" begin
     s = PtySession(`sh -c "exit 3"`)
     wait(s)

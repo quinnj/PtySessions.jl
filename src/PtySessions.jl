@@ -21,11 +21,13 @@ wait(session)
 """
 module PtySessions
 
-export PtySession, isactive, exitcode, getsize, setecho, getecho
+export PtySession, expect, ExpectTimeoutError, isactive, exitcode, getsize, setecho, getecho
 
 # The pty line discipline needs a signal we can't get from Base; value is 28 on
 # both Linux and macOS.
 const SIGWINCH = Cint(28)
+
+const PendingBuffer = typeof(PipeBuffer())
 
 """
     PtySession <: IO
@@ -38,13 +40,22 @@ terminal echo of anything written), and writing to it feeds the child's input.
 Reads and writes are integrated with Julia's event loop, so they block only the
 calling task, never the whole process.
 
+Reading from a session is single-consumer: interleave [`expect`](@ref),
+`readline`, `readavailable`, etc. freely from one task, but don't read from
+the same session concurrently from multiple tasks.
+
 Construct with [`PtySession(cmd::Cmd)`](@ref); see [`isactive`](@ref),
 `wait(session)`, `kill(session)`, `close(session)` for lifecycle management.
 """
-struct PtySession <: IO
-    process::Base.Process
-    master::Base.TTY
-    cmd::Cmd
+mutable struct PtySession <: IO
+    const process::Base.Process
+    const master::Base.TTY
+    const cmd::Cmd
+    # output already pulled off the master but not yet consumed by the user
+    # (expect reads ahead: data after a match arrives in the same chunk)
+    const pending::PendingBuffer
+    # in-flight `eof` waiter task, reused across expect calls that time out
+    reader::Union{Task, Nothing}
 end
 
 # ptsname(3) returns a pointer to static storage; serialize pty allocation so
@@ -163,7 +174,7 @@ function PtySession(cmd::Cmd; env=nothing, dir=nothing,
     # child exits, reads on the master see EOF.
     ccall(:close, Cint, (Cint,), slave_fd)
 
-    return PtySession(process, master, cmd)
+    return PtySession(process, master, cmd, PipeBuffer(), nothing)
 end
 
 """
@@ -206,19 +217,177 @@ function _master_fd(s::PtySession)
     return fd[]
 end
 
-# ── IO interface: forward to the master stream ──────────────────────────────
+# ── IO interface ────────────────────────────────────────────────────────────
+# Reads consult the pending (readahead) buffer first, then the master stream;
+# writes go straight to the master.
 
 Base.isopen(s::PtySession) = isopen(s.master)
-Base.eof(s::PtySession) = eof(s.master)
-Base.bytesavailable(s::PtySession) = bytesavailable(s.master)
-Base.readavailable(s::PtySession) = readavailable(s.master)
-Base.read(s::PtySession, ::Type{UInt8}) = read(s.master, UInt8)
-Base.unsafe_read(s::PtySession, p::Ptr{UInt8}, n::UInt) = unsafe_read(s.master, p, n)
+Base.eof(s::PtySession) = bytesavailable(s.pending) > 0 ? false : eof(s.master)
+Base.bytesavailable(s::PtySession) = bytesavailable(s.pending) + bytesavailable(s.master)
+
+function Base.readavailable(s::PtySession)
+    if bytesavailable(s.pending) > 0
+        out = read(s.pending)
+        bytesavailable(s.master) > 0 && append!(out, readavailable(s.master))
+        return out
+    end
+    return readavailable(s.master)
+end
+
+function Base.read(s::PtySession, ::Type{UInt8})
+    bytesavailable(s.pending) > 0 && return read(s.pending, UInt8)
+    return read(s.master, UInt8)
+end
+
+function Base.unsafe_read(s::PtySession, p::Ptr{UInt8}, n::UInt)
+    nb = UInt(bytesavailable(s.pending))
+    if nb > 0
+        k = min(n, nb)
+        unsafe_read(s.pending, p, k)
+        n -= k
+        p += k
+    end
+    n > 0 && unsafe_read(s.master, p, n)
+    return nothing
+end
+
 Base.write(s::PtySession, b::UInt8) = write(s.master, b)
 Base.unsafe_write(s::PtySession, p::Ptr{UInt8}, n::UInt) = unsafe_write(s.master, p, n)
 Base.flush(s::PtySession) = flush(s.master)
-Base.isreadable(s::PtySession) = isreadable(s.master)
+Base.isreadable(s::PtySession) = bytesavailable(s.pending) > 0 || isreadable(s.master)
 Base.iswritable(s::PtySession) = iswritable(s.master)
+
+# ── expect ──────────────────────────────────────────────────────────────────
+
+"""
+    ExpectTimeoutError(pattern, timeout)
+
+Thrown by [`expect`](@ref) (and `readuntil` with a `timeout`) when the pattern
+does not appear in the session's output within `timeout` seconds. Any output
+consumed while waiting remains buffered and readable from the session.
+"""
+struct ExpectTimeoutError <: Exception
+    pattern::Union{String, Regex}
+    timeout::Float64
+end
+
+Base.showerror(io::IO, e::ExpectTimeoutError) =
+    print(io, "ExpectTimeoutError: no match for ", repr(e.pattern),
+          " in session output within ", e.timeout, " seconds")
+
+const DEFAULT_EXPECT_TIMEOUT = 30.0
+
+# Byte index in `data` of the end of the first match, or nothing.
+function _match_end(pattern::AbstractString, data::Vector{UInt8})
+    r = findfirst(codeunits(String(pattern)), data)
+    return r === nothing ? nothing : last(r)
+end
+
+function _match_end(pattern::Regex, data::Vector{UInt8})
+    str = String(copy(data))
+    m = match(pattern, str)
+    m === nothing && return nothing
+    return m.offset + ncodeunits(m.match) - 1
+end
+
+# Move everything currently readable on the master into the pending buffer.
+function _drain!(s::PtySession)
+    while bytesavailable(s.master) > 0
+        write(s.pending, readavailable(s.master))
+    end
+    return nothing
+end
+
+# Wait until the master has data (:data), reaches EOF (:eof), or the deadline
+# passes (:timeout). `eof` blocks until one of the first two, so we run it in a
+# task and poll for its completion; a task orphaned by a timeout is kept and
+# reused by the next call instead of leaking one task per attempt.
+function _wait_input(s::PtySession, deadline::Float64)
+    bytesavailable(s.master) > 0 && return :data
+    t = s.reader
+    if t === nothing || istaskdone(t)
+        stream = s.master
+        t = @async eof(stream)
+        s.reader = t
+    end
+    remaining = min(deadline - time(), 3600.0)  # timedwait needs a finite timeout
+    remaining <= 0 && return :timeout
+    timedwait(() -> istaskdone(t), remaining; pollint=0.01) === :timed_out && return :timeout
+    return (fetch(t)::Bool) ? :eof : :data
+end
+
+"""
+    expect(session::PtySession, pattern::Union{AbstractString, Regex};
+           timeout::Real=$(DEFAULT_EXPECT_TIMEOUT)) -> String
+
+Read from the session until its output matches `pattern`, and return
+everything read up to and including the match. Output arriving after the match
+stays buffered for subsequent reads.
+
+Throws [`ExpectTimeoutError`](@ref) if the pattern doesn't appear within
+`timeout` seconds, and `EOFError` if the session's output ends without a
+match; in both cases the output consumed while waiting remains buffered and
+readable (e.g. via `readavailable`).
+
+```julia
+session = PtySession(`sh`; echo=false)
+write(session, "echo result=\\\$((6 * 7))\\n")
+expect(session, r"result=\\d+")   # ⇒ "… result=42"
+```
+"""
+function expect(s::PtySession, pattern::Union{AbstractString, Regex};
+                timeout::Real=DEFAULT_EXPECT_TIMEOUT)
+    timeout > 0 || throw(ArgumentError("timeout must be positive, got $timeout"))
+    pattern isa AbstractString && isempty(pattern) &&
+        throw(ArgumentError("pattern must be non-empty"))
+    deadline = time() + timeout
+    saw_eof = false
+    while true
+        _drain!(s)
+        data = read(s.pending)
+        stop = _match_end(pattern, data)
+        if stop !== nothing
+            write(s.pending, @view data[stop+1:end])
+            return String(data[1:stop])
+        end
+        write(s.pending, data)
+        saw_eof && throw(EOFError())
+        status = _wait_input(s, deadline)
+        if status === :timeout
+            throw(ExpectTimeoutError(pattern isa Regex ? pattern : String(pattern),
+                                     Float64(timeout)))
+        elseif status === :eof
+            saw_eof = true
+        end
+    end
+end
+
+"""
+    readuntil(session::PtySession, delim::AbstractString;
+              keep::Bool=false, timeout::Real=Inf) -> String
+
+Like `Base.readuntil`, with an optional `timeout` in seconds: read until
+`delim` appears in the session's output and return everything before it
+(including it when `keep=true`). Returns the data read so far if the output
+ends before `delim` appears; throws [`ExpectTimeoutError`](@ref) on timeout.
+"""
+function Base.readuntil(s::PtySession, delim::AbstractString;
+                        keep::Bool=false, timeout::Real=Inf)
+    matched = try
+        expect(s, delim; timeout=timeout)
+    catch e
+        # Base.readuntil semantics: EOF before the delimiter yields the data
+        # read so far rather than throwing
+        e isa EOFError && return String(read(s.pending))
+        rethrow()
+    end
+    keep && return matched
+    bytes = codeunits(matched)
+    return String(bytes[1:end-ncodeunits(String(delim))])
+end
+
+Base.readuntil(s::PtySession, delim::AbstractChar; kwargs...) =
+    readuntil(s, string(delim); kwargs...)
 
 """
     close(session::PtySession; force::Bool=false)
