@@ -1,74 +1,154 @@
 using Test
 using PtySessions
 
-# Disable finalizers during testing to avoid cleanup issues
-# Each test will explicitly close its sessions
-
-println("Running PtySessions tests...")
-
 @testset "PtySessions.jl" begin
-    @testset "Basic functionality" begin
-        # Test 1: Creation and basic I/O
-        session = PtySession(`cat`)
-        @test session isa PtySession
-        @test isactive(session)
 
-        write(session, "hello\n")
-        sleep(0.2)
-        output = PtySessions.readavailable(session)
-        @test occursin("hello", output)
+@testset "creation and IO basics" begin
+    s = PtySession(`cat`)
+    @test s isa PtySession
+    @test s isa IO
+    @test isopen(s)
+    @test isactive(s)
+    @test isreadable(s)
+    @test iswritable(s)
 
-        # Explicitly close without finalizer
-        if session.master_fd >= 0
-            ccall(:close, Cint, (Cint,), session.master_fd)
-            session.master_fd = -1
-        end
-    end
+    write(s, "hello\n")
+    # The pty echoes input by default (with CRLF), then cat's copy follows.
+    echoed = readline(s)
+    @test occursin("hello", echoed)
+    output = readline(s)
+    @test occursin("hello", output)
 
-    @testset "Working directory" begin
-        tmpdir = mktempdir()
-        session = PtySession(`sh -c "pwd"`; dir=tmpdir)
-        sleep(0.3)
-        output = PtySessions.readavailable(session)
-        wait(session)
-        @test occursin(tmpdir, output)
+    close(s)
+    @test !isopen(s)
+    wait(s)          # cat sees EOF once the master closes and exits
+    @test !isactive(s)
+end
 
-        # Cleanup
-        if session.master_fd >= 0
-            ccall(:close, Cint, (Cint,), session.master_fd)
-            session.master_fd = -1
-        end
-        rm(tmpdir, recursive=true)
-    end
+@testset "UTF-8 round trip" begin
+    # Regression: the old byte-at-a-time readline re-encoded each UTF-8 byte
+    # as its own Char, corrupting any non-ASCII output.
+    s = PtySession(`cat`)
+    write(s, "héllo wörld ✓\n")
+    echoed = readline(s)
+    @test occursin("héllo wörld ✓", echoed)
+    close(s)
+    wait(s)
+end
 
-    @testset "Environment variables" begin
-        session = PtySession(`sh -c "echo \$TESTVAR"`; env=Dict("TESTVAR" => "testvalue"))
-        sleep(0.3)
-        output = PtySessions.readavailable(session)
-        wait(session)
-        @test occursin("testvalue", output)
+@testset "readuntil follows Base semantics" begin
+    s = PtySession(`cat`)
+    write(s, "abc MARKER def\n")
+    out = readuntil(s, "MARKER")
+    @test occursin("abc", out)
+    @test !occursin("MARKER", out)
+    out = readuntil(s, "MARKER"; keep=true)
+    @test endswith(out, "MARKER")
+    close(s)
+    wait(s)
+end
 
-        # Cleanup
-        if session.master_fd >= 0
-            ccall(:close, Cint, (Cint,), session.master_fd)
-            session.master_fd = -1
-        end
-    end
+@testset "read to EOF" begin
+    s = PtySession(`sh -c "printf 'chunk1 '; printf 'chunk2\n'"`)
+    data = read(s, String)
+    @test occursin("chunk1 chunk2", data)
+    wait(s)
+    @test !isactive(s)
+    close(s)
+end
 
-    @testset "Process management" begin
-        session = PtySession(`cat`)
-        sleep(0.1)
-
-        @test isactive(session)
-        pid = PtySessions.getpid(session)
-        @test pid > 0
-
-        # Cleanup
-        if session.master_fd >= 0
-            ccall(:close, Cint, (Cint,), session.master_fd)
-            session.master_fd = -1
-        end
+@testset "working directory" begin
+    mktempdir() do tmp
+        s = PtySession(`sh -c "pwd"`; dir=tmp)
+        data = read(s, String)
+        @test occursin(realpath(tmp), data)
+        wait(s)
+        close(s)
     end
 end
 
-println("All tests passed!")
+@testset "environment" begin
+    s = PtySession(`sh -c "echo VAR=\$MYVAR"`;
+                   env=Dict("MYVAR" => "ptyval", "PATH" => ENV["PATH"]))
+    data = read(s, String)
+    @test occursin("VAR=ptyval", data)
+    wait(s)
+    close(s)
+end
+
+@testset "child sees a terminal" begin
+    s = PtySession(`sh -c "test -t 0 && test -t 1 && test -t 2 && echo ISATTY"`)
+    @test occursin("ISATTY", read(s, String))
+    wait(s)
+    close(s)
+end
+
+@testset "resize! and getsize" begin
+    s = PtySession(`cat`)
+    resize!(s, 30, 100)
+    @test getsize(s) == (30, 100)
+    @test resize!(s, 24, 80) === s
+    @test getsize(s) == (24, 80)
+    @test_throws ArgumentError resize!(s, -1, 80)
+    @test_throws ArgumentError resize!(s, 24, 100_000)
+    close(s)
+    wait(s)
+    # size queries on a closed session fail cleanly rather than using a stale fd
+    @test_throws Base.IOError getsize(s)
+    @test_throws Base.IOError resize!(s, 24, 80)
+end
+
+@testset "child observes resize" begin
+    # The child blocks on `read` until we release it, so the resize is
+    # guaranteed to land before stty queries the size.
+    s = PtySession(`sh -c "read line; stty size"`)
+    resize!(s, 37, 91)
+    write(s, "go\n")
+    data = read(s, String)
+    @test occursin("37 91", data)
+    wait(s)
+    close(s)
+end
+
+@testset "process management" begin
+    s = PtySession(`cat`)
+    @test getpid(s) > 0
+    kill(s)              # SIGTERM by default
+    wait(s)
+    @test !isactive(s)
+    close(s)
+end
+
+@testset "close(force=true) kills stubborn children" begin
+    # sleep never reads its terminal, so EOF alone wouldn't stop it
+    s = PtySession(`sleep 100`)
+    close(s; force=true)
+    wait(s)
+    @test !isactive(s)
+end
+
+@testset "error paths" begin
+    @test_throws Base.IOError PtySession(`this-command-does-not-exist-8b1b437c`)
+    s = PtySession(`cat`)
+    close(s; force=true)
+    @test_throws Exception write(s, "x")
+    wait(s)
+end
+
+@testset "concurrent sessions" begin
+    n = 6
+    outs = Vector{String}(undef, n)
+    @sync for i in 1:n
+        @async begin
+            s = PtySession(`sh -c $("echo session-$i")`)
+            outs[i] = read(s, String)
+            wait(s)
+            close(s)
+        end
+    end
+    for i in 1:n
+        @test occursin("session-$i", outs[i])
+    end
+end
+
+end # top-level testset
