@@ -1,7 +1,12 @@
 using Test
+using Aqua
 using PtySessions
 
 @testset "PtySessions.jl" begin
+
+@testset "Aqua quality checks" begin
+    Aqua.test_all(PtySessions)
+end
 
 @testset "creation and IO basics" begin
     s = PtySession(`cat`)
