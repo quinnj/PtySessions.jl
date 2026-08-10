@@ -83,7 +83,7 @@ Process management:
 Terminal control:
 
 - `resize!(session, rows, cols)` — set window size and notify the child (SIGWINCH)
-- `PtySessions.getsize(session)` — current `(rows, cols)`
+- `displaysize(session)` / `PtySessions.getsize(session)` — current `(rows, cols)`
 - `PtySessions.setecho(session, on)` / `PtySessions.getecho(session)` — toggle input echo
 
 ## Terminal behavior notes

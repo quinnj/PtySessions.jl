@@ -123,6 +123,7 @@ end
     s = PtySession(`cat`)
     resize!(s, 30, 100)
     @test PtySessions.getsize(s) == (30, 100)
+    @test displaysize(s) == (30, 100)
     @test resize!(s, 24, 80) === s
     @test PtySessions.getsize(s) == (24, 80)
     @test_throws ArgumentError resize!(s, -1, 80)

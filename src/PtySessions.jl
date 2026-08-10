@@ -691,6 +691,8 @@ function getsize(s::PtySession)
     return (Int(ws[].ws_row), Int(ws[].ws_col))
 end
 
+Base.displaysize(s::PtySession) = getsize(s)
+
 # ── Echo control ────────────────────────────────────────────────────────────
 
 # We only need the c_lflag field of struct termios, whose layout differs per

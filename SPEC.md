@@ -41,7 +41,7 @@ the master side as a standard Julia `IO`.
 
 ### 5. Terminal Control
 - `resize!(session, rows, cols)`: set window size, deliver SIGWINCH
-- `PtySessions.getsize(session)`: current `(rows, cols)`
+- `displaysize(session)` / `PtySessions.getsize(session)`: current `(rows, cols)`
 - `PtySessions.setecho(session, on)` / `PtySessions.getecho(session)`: input echo control
 
 ## Implementation Requirements
