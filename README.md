@@ -75,22 +75,22 @@ Interaction (beyond the standard `IO` interface):
 
 Process management:
 
-- `isactive(session)` / `process_running` / `process_exited`
-- `wait(session)`, `success(session)`, `exitcode(session)`, `getpid(session)`
+- `PtySessions.isactive(session)` / `process_running` / `process_exited`
+- `wait(session)`, `success(session)`, `PtySessions.exitcode(session)`, `getpid(session)`
 - `kill(session, signum=SIGTERM)`
 - `close(session; force=false)` — closes the pty; `force=true` also SIGKILLs
 
 Terminal control:
 
 - `resize!(session, rows, cols)` — set window size and notify the child (SIGWINCH)
-- `getsize(session)` — current `(rows, cols)`
-- `setecho(session, on)` / `getecho(session)` — toggle input echo
+- `PtySessions.getsize(session)` — current `(rows, cols)`
+- `PtySessions.setecho(session, on)` / `PtySessions.getecho(session)` — toggle input echo
 
 ## Terminal behavior notes
 
 - **Echo**: a pty echoes input back by default, so everything you `write`
   reappears in the output stream. Pass `echo=false` (or call
-  `setecho(session, false)`) for clean scripted interaction.
+  `PtySessions.setecho(session, false)`) for clean scripted interaction.
 - **CRLF**: terminal output translates `\n` to `\r\n` (ONLCR). Expect `"\r\n"`
   line endings when matching output.
 - **No controlling terminal**: the child runs in its own session (`setsid`),

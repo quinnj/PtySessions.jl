@@ -21,7 +21,7 @@ wait(session)
 """
 module PtySessions
 
-export PtySession, expect, ExpectTimeoutError, isactive, exitcode, getsize, setecho, getecho
+export PtySession, expect, ExpectTimeoutError
 
 # The pty line discipline needs a signal we can't get from Base; value is 28 on
 # both Linux and macOS.

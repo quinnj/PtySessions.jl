@@ -33,16 +33,16 @@ the master side as a standard Julia `IO`.
   semantics plus optional timeout
 
 ### 4. Session Management
-- `isactive(session)` (alias of `process_running`), `process_exited`
-- `wait(session)`, `success(session)`, `exitcode(session)`
+- `PtySessions.isactive(session)` (alias of `process_running`), `process_exited`
+- `wait(session)`, `success(session)`, `PtySessions.exitcode(session)`
 - `kill(session, signum=SIGTERM)` signals the session's private process group
 - `getpid(session)` (extends `Base.getpid`)
 - `close(session; force=false)`: closes the master; `force=true` also SIGKILLs
 
 ### 5. Terminal Control
 - `resize!(session, rows, cols)`: set window size, deliver SIGWINCH
-- `getsize(session)`: current `(rows, cols)`
-- `setecho(session, on)` / `getecho(session)`: input echo control
+- `PtySessions.getsize(session)`: current `(rows, cols)`
+- `PtySessions.setecho(session, on)` / `PtySessions.getecho(session)`: input echo control
 
 ## Implementation Requirements
 

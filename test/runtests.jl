@@ -6,6 +6,8 @@ using PtySessions
 
 @testset "Aqua quality checks" begin
     Aqua.test_all(PtySessions)
+    @test Set(names(PtySessions)) ==
+          Set((:ExpectTimeoutError, :PtySession, :PtySessions, :expect))
 end
 
 @testset "creation and IO basics" begin
@@ -13,7 +15,7 @@ end
     @test s isa PtySession
     @test s isa IO
     @test isopen(s)
-    @test isactive(s)
+    @test PtySessions.isactive(s)
     @test isreadable(s)
     @test iswritable(s)
 
@@ -35,7 +37,7 @@ end
     close(s)
     @test !isopen(s)
     wait(s)          # cat sees EOF once the master closes and exits
-    @test !isactive(s)
+    @test !PtySessions.isactive(s)
 end
 
 @testset "terminal operations serialize with close" begin
@@ -87,7 +89,7 @@ end
     data = read(s, String)
     @test occursin("chunk1 chunk2", data)
     wait(s)
-    @test !isactive(s)
+    @test !PtySessions.isactive(s)
     close(s)
 end
 
@@ -120,15 +122,15 @@ end
 @testset "resize! and getsize" begin
     s = PtySession(`cat`)
     resize!(s, 30, 100)
-    @test getsize(s) == (30, 100)
+    @test PtySessions.getsize(s) == (30, 100)
     @test resize!(s, 24, 80) === s
-    @test getsize(s) == (24, 80)
+    @test PtySessions.getsize(s) == (24, 80)
     @test_throws ArgumentError resize!(s, -1, 80)
     @test_throws ArgumentError resize!(s, 24, 100_000)
     close(s)
     wait(s)
     # size queries on a closed session fail cleanly rather than using a stale fd
-    @test_throws Base.IOError getsize(s)
+    @test_throws Base.IOError PtySessions.getsize(s)
     @test_throws Base.IOError resize!(s, 24, 80)
 end
 
@@ -146,7 +148,7 @@ end
 
 @testset "initial window size" begin
     s = PtySession(`cat`)
-    @test getsize(s) == (24, 80)      # default, not a confusing 0×0
+    @test PtySessions.getsize(s) == (24, 80)  # default, not a confusing 0×0
     close(s)
     wait(s)
 
@@ -161,7 +163,7 @@ end
 @testset "echo control" begin
     # default: echo on — input appears twice (echo + cat's copy)
     s = PtySession(`cat`)
-    @test getecho(s)
+    @test PtySessions.getecho(s)
     write(s, "marker\n\x04")          # \x04 = VEOF at line start: cat exits
     data = read(s, String)
     @test count("marker", data) == 2
@@ -170,7 +172,7 @@ end
 
     # echo=false: input appears exactly once
     s = PtySession(`cat`; echo=false)
-    @test !getecho(s)
+    @test !PtySessions.getecho(s)
     write(s, "marker\n\x04")
     data = read(s, String)
     @test count("marker", data) == 1
@@ -179,10 +181,10 @@ end
 
     # toggling at runtime
     s = PtySession(`cat`; echo=false)
-    setecho(s, true)
-    @test getecho(s)
-    setecho(s, false)
-    @test !getecho(s)
+    PtySessions.setecho(s, true)
+    @test PtySessions.getecho(s)
+    PtySessions.setecho(s, false)
+    @test !PtySessions.getecho(s)
     close(s; force=true)
     wait(s)
 end
@@ -192,7 +194,7 @@ end
     @test getpid(s) > 0
     kill(s)              # SIGTERM by default
     wait(s)
-    @test !isactive(s)
+    @test !PtySessions.isactive(s)
     close(s)
 end
 
@@ -299,7 +301,7 @@ end
     expect(s, "READY"; timeout=15)   # trap is installed before READY prints
     resize!(s, 31, 81)
     @test occursin("GOTWINCH", expect(s, "GOTWINCH"; timeout=15))
-    @test getsize(s) == (31, 81)
+    @test PtySessions.getsize(s) == (31, 81)
     close(s; force=true)
     wait(s)
 
@@ -326,7 +328,7 @@ end
     wait(s)
     @test process_exited(s)
     @test !process_running(s)
-    @test exitcode(s) == 3
+    @test PtySessions.exitcode(s) == 3
     @test !success(s)
     @test occursin("exited, code=3", sprint(show, s))
     close(s)
@@ -334,7 +336,7 @@ end
 
     s = PtySession(`cat`)
     @test process_running(s)
-    @test_throws ArgumentError exitcode(s)
+    @test_throws ArgumentError PtySessions.exitcode(s)
     shown = sprint(show, s)
     @test occursin("running, pid=", shown)
     @test occursin("cat", shown)
@@ -347,7 +349,7 @@ end
     # success == true for a child that exits 0 on its own
     s = PtySession(`sh -c "echo done"`)
     @test success(s)
-    @test exitcode(s) == 0
+    @test PtySessions.exitcode(s) == 0
     close(s)
 end
 
@@ -364,7 +366,7 @@ end
     elapsed = @elapsed PtySession(`sleep 100`) do s
         captured = s
     end
-    @test !isactive(captured)
+    @test !PtySessions.isactive(captured)
     @test !isopen(captured)
     @test elapsed < 30
 
@@ -374,7 +376,7 @@ end
         captured2 = s
         error("boom")
     end
-    @test !isactive(captured2)
+    @test !PtySessions.isactive(captured2)
     @test !isopen(captured2)
 end
 
@@ -383,7 +385,7 @@ end
     s = PtySession(`sleep 100`)
     close(s; force=true)
     wait(s)
-    @test !isactive(s)
+    @test !PtySessions.isactive(s)
 end
 
 @testset "error paths" begin
