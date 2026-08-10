@@ -224,8 +224,25 @@ end
 # Reads consult the pending (readahead) buffer first, then the master stream;
 # writes go straight to the master.
 
+# On Linux, read(2) on a pty master fails with EIO once the last slave fd is
+# closed (i.e. the child exited and its terminal hung up); macOS/BSD return a
+# clean EOF instead. Translate the hangup into EOF so sessions read uniformly
+# on both platforms. Data buffered before the hangup is never lost: the error
+# only surfaces once the stream's buffer is empty. Write errors are NOT
+# translated — writing to a hung-up session is a real error.
+_is_pty_hangup(e) = e isa Base.IOError && e.code == Base.UV_EIO
+
+function _eof(master::Base.TTY)
+    try
+        return eof(master)
+    catch e
+        _is_pty_hangup(e) && return true
+        rethrow()
+    end
+end
+
 Base.isopen(s::PtySession) = isopen(s.master)
-Base.eof(s::PtySession) = bytesavailable(s.pending) > 0 ? false : eof(s.master)
+Base.eof(s::PtySession) = bytesavailable(s.pending) > 0 ? false : _eof(s.master)
 Base.bytesavailable(s::PtySession) = bytesavailable(s.pending) + bytesavailable(s.master)
 
 function Base.readavailable(s::PtySession)
@@ -234,12 +251,22 @@ function Base.readavailable(s::PtySession)
         bytesavailable(s.master) > 0 && append!(out, readavailable(s.master))
         return out
     end
-    return readavailable(s.master)
+    try
+        return readavailable(s.master)
+    catch e
+        _is_pty_hangup(e) && return UInt8[]
+        rethrow()
+    end
 end
 
 function Base.read(s::PtySession, ::Type{UInt8})
     bytesavailable(s.pending) > 0 && return read(s.pending, UInt8)
-    return read(s.master, UInt8)
+    try
+        return read(s.master, UInt8)
+    catch e
+        _is_pty_hangup(e) && throw(EOFError())
+        rethrow()
+    end
 end
 
 function Base.unsafe_read(s::PtySession, p::Ptr{UInt8}, n::UInt)
@@ -250,7 +277,14 @@ function Base.unsafe_read(s::PtySession, p::Ptr{UInt8}, n::UInt)
         n -= k
         p += k
     end
-    n > 0 && unsafe_read(s.master, p, n)
+    if n > 0
+        try
+            unsafe_read(s.master, p, n)
+        catch e
+            _is_pty_hangup(e) && throw(EOFError())
+            rethrow()
+        end
+    end
     return nothing
 end
 
@@ -317,7 +351,7 @@ function _wait_input(s::PtySession, deadline::Float64)
     t = s.reader
     if t === nothing || istaskdone(t)
         stream = s.master
-        t = @async eof(stream)
+        t = @async _eof(stream)
         s.reader = t
     end
     remaining = min(deadline - time(), 3600.0)  # timedwait needs a finite timeout
@@ -410,10 +444,11 @@ Base.readuntil(s::PtySession, delim::AbstractChar; kwargs...) =
 """
     close(session::PtySession; force::Bool=false)
 
-Close the master side of the pty. Children that read their terminal see EOF
-and typically exit on their own; call `wait(session)` afterwards to reap the
-process. With `force=true`, also send `SIGKILL` to the child if it is still
-running.
+Close the master side of the pty. Children that read their terminal observe
+the hangup (end-of-file on macOS/BSD, `EIO` on Linux) and typically exit on
+their own — though their exit status after a hangup is platform-dependent.
+Call `wait(session)` afterwards to reap the process. With `force=true`, also
+send `SIGKILL` to the child if it is still running.
 """
 function Base.close(s::PtySession; force::Bool=false)
     close(s.master)
@@ -486,12 +521,14 @@ end
 
 function Base.show(io::IO, s::PtySession)
     print(io, "PtySession(", s.cmd, ", ")
-    if Base.process_running(s.process)
-        print(io, "running, pid=", getpid(s))
+    # the process can exit between the check and the pid query; show must not throw
+    pid = Base.process_running(s.process) ? (try; getpid(s); catch; nothing; end) : nothing
+    if pid !== nothing
+        print(io, "running, pid=", pid)
     elseif Base.process_exited(s.process)
         print(io, "exited, code=", s.process.exitcode)
     else
-        print(io, "not started")
+        print(io, "running")
     end
     isopen(s) || print(io, ", closed")
     print(io, ")")

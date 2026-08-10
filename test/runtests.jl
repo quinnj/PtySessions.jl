@@ -174,7 +174,7 @@ end
     @test endswith(out, "two")
     @test occursin("one", out)
     # data after the match stays buffered for subsequent reads
-    @test bytesavailable(s) > 0 || occursin("three", readuntil(s, "three"; keep=true, timeout=15))
+    @test occursin("three", readuntil(s, "three"; keep=true, timeout=15))
 
     # regex pattern
     write(s, "code=1234 done\n")
@@ -274,8 +274,16 @@ end
     @test occursin("running, pid=", shown)
     @test occursin("cat", shown)
     close(s)
-    @test success(s)     # cat exits 0 on EOF; success waits for it
+    wait(s)
+    # cat exits after the hangup, but its status is platform-dependent:
+    # 0 on macOS/BSD (clean EOF), nonzero on Linux (EIO)
+    @test process_exited(s)
+
+    # success == true for a child that exits 0 on its own
+    s = PtySession(`sh -c "echo done"`)
+    @test success(s)
     @test exitcode(s) == 0
+    close(s)
 end
 
 @testset "do-block constructor" begin
@@ -317,7 +325,7 @@ end
     @test_throws Base.IOError PtySession(`this-command-does-not-exist-8b1b437c`)
     s = PtySession(`cat`)
     close(s; force=true)
-    @test_throws Exception write(s, "x")
+    @test_throws Base.IOError write(s, "x")
     wait(s)
 end
 

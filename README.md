@@ -100,9 +100,11 @@ Terminal control:
   when the master closes (most programs still exit on the EOF they see), and
   job-control shells print a "no job control" warning. This matches the
   fake-pty approach Julia's own test suite uses.
-- **EOF**: `close(session)` closes the master; children reading their terminal
-  see EOF and typically exit — `wait(session)` then reaps. For children that
-  ignore their terminal, use `close(session; force=true)`.
+- **Hangup on close**: `close(session)` closes the master; children reading
+  their terminal observe the hangup (EOF on macOS/BSD, `EIO` on Linux) and
+  typically exit — `wait(session)` then reaps. Reads from the session side
+  uniformly report EOF either way. For children that ignore their terminal,
+  use `close(session; force=true)`.
 
 ## Alternatives
 
