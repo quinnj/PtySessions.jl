@@ -1,81 +1,88 @@
 # PtySessions Specification
 
 ## Overview
-PtySessions is a Julia package for managing pseudo-terminal (PTY) sessions. It provides a high-level interface for creating, managing, and interacting with PTY sessions.
+PtySessions is a Julia package for managing pseudo-terminal (PTY) sessions:
+spawning commands attached to a pty slave and interacting with them through
+the master side as a standard Julia `IO`.
 
 ## Core Features
 
 ### 1. PtySession Type
-- Main type representing a PTY session
-- Fields:
-  - `process`: The underlying process
-  - `master`: Master PTY file descriptor
-  - `slave`: Slave PTY file descriptor (optional, for internal use)
-  - `buffer`: IO buffer for reading output
-  - `active`: Boolean indicating if session is active
+- `PtySession <: IO`; reads return the child's output, writes feed its input
+- Wraps the child `Process` and the pty master as a libuv-backed stream
+  (`Base.TTY`), so all I/O cooperates with Julia's task scheduler
+- Maintains a readahead buffer so pattern-matching reads (`expect`) compose
+  with plain IO reads
 
 ### 2. Session Creation
-- `PtySession(cmd::Cmd; env=ENV, dir=pwd())`: Create a new PTY session
-  - Spawns command in a pseudo-terminal
-  - Supports custom environment variables
-  - Supports custom working directory
-  - Returns PtySession object
+- `PtySession(cmd::Cmd; env=nothing, dir=nothing, rows=24, cols=80, echo=true)`
+  - Spawns the command in a fresh pty, in its own session (`setsid`)
+  - `env`/`dir` use `Cmd`'s native support (no global state mutation)
+  - Initial window size is applied before the child starts
+  - `echo=false` disables terminal echo for scripted interaction
+- `PtySession(f::Function, cmd::Cmd; kwargs...)` do-block form with guaranteed
+  cleanup (close, grace period, force-kill, reap)
 
 ### 3. Session Interaction
-- `write(session::PtySession, data::String)`: Write data to PTY
-- `read(session::PtySession)`: Read available output from PTY
-- `readuntil(session::PtySession, marker::String; timeout=nothing)`: Read until marker found
-- `readline(session::PtySession)`: Read a single line
-- `readavailable(session::PtySession)`: Read all currently available data
+- The standard `IO` interface: `write`, `print`, `readline`, `readavailable`,
+  `read`, `eachline`, `eof`, `bytesavailable`, …
+- `expect(session, pattern::Union{AbstractString,Regex}; timeout=30)`: read
+  until the output matches, return everything through the match; throws
+  `ExpectTimeoutError` on timeout, `EOFError` at end of output
+- `readuntil(session, delim; keep=false, timeout=Inf)`: `Base.readuntil`
+  semantics plus optional timeout
 
 ### 4. Session Management
-- `isactive(session::PtySession)`: Check if session is active
-- `wait(session::PtySession)`: Wait for session to complete
-- `kill(session::PtySession, signal=Base.SIGTERM)`: Send signal to session
-- `close(session::PtySession)`: Close the PTY session
+- `PtySessions.isactive(session)` (alias of `process_running`), `process_exited`
+- `wait(session)`, `success(session)`, `PtySessions.exitcode(session)`
+- `kill(session, signum=SIGTERM)` signals the session's private process group
+- `getpid(session)` (extends `Base.getpid`)
+- `close(session; force=false)`: closes the master; `force=true` also SIGKILLs
+  the session process group
 
-### 5. Utility Functions
-- `resize!(session::PtySession, rows::Int, cols::Int)`: Resize PTY window
-- `getsize(session::PtySession)`: Get current PTY size as (rows, cols)
-- `pid(session::PtySession)`: Get process ID
+### 5. Terminal Control
+- `resize!(session, rows, cols)`: set window size, deliver SIGWINCH
+- `displaysize(session)` / `PtySessions.getsize(session)`: current `(rows, cols)`
+- `PtySessions.setecho(session, on)` / `PtySessions.getecho(session)`: input echo control
 
 ## Implementation Requirements
 
 ### Platform Support
-- Must work on Unix-like systems (Linux, macOS)
-- Use Julia's built-in `ccall` for PTY operations
-- Proper error handling for platform-specific operations
+- Unix-like systems (Linux, macOS); clear error on other platforms
+- `ccall` only for the pty syscall layer (`posix_openpt`, `grantpt`,
+  `unlockpt`, `ptsname`, `ioctl`, `tcgetattr`/`tcsetattr`); all streaming I/O
+  goes through Julia's event loop, never raw blocking `read`/`write` ccalls
+- `ioctl` ccalls must declare the pointer argument variadic (ABI correctness
+  on aarch64-darwin)
 
 ### Resource Management
-- Proper cleanup of file descriptors
-- Finalizers for automatic cleanup
-- No resource leaks
+- Every fd owned by exactly one object; no double-close paths
+- Pty fds are CLOEXEC so unrelated children can't inherit them
+- Slave opened with `O_NOCTTY`; parent never acquires the pty as its
+  controlling terminal
+- Pty allocation serialized (ptsname's static buffer is not thread-safe)
 
 ### Error Handling
-- Clear error messages
-- Proper exception types
-- Handle edge cases (closed sessions, terminated processes, etc.)
+- Syscall failures raise `SystemError` with errno captured at the failure site
+- `ExpectTimeoutError` for pattern timeouts; buffered output is never lost on
+  error paths
+- Clear messages for closed-session operations
 
 ### Testing
-- Unit tests for all public functions
-- Integration tests for common workflows
-- Test error conditions
-- Test resource cleanup
+- Unit tests for all public functions, error conditions, and cleanup paths
+- Aqua.jl quality checks (ambiguities, piracy, export hygiene)
+- Known limitation (documented, inherent to libuv spawn): the child has no
+  controlling terminal, so line-discipline signal generation (^C) and
+  kernel-delivered SIGHUP/SIGWINCH don't apply; the package delivers signals
+  directly instead
 
 ## Example Usage
 
 ```julia
 using PtySessions
 
-# Create a bash session
-session = PtySession(`bash`)
-
-# Write commands
-write(session, "echo Hello\n")
-
-# Read output
-output = readavailable(session)
-
-# Clean up
-close(session)
+PtySession(`sh`; echo=false) do session
+    write(session, "echo hello\n")
+    expect(session, "hello")
+end
 ```

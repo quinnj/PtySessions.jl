@@ -1,592 +1,761 @@
+"""
+    PtySessions
+
+Create and interact with pseudo-terminal (PTY) sessions on Unix-like systems
+(Linux, macOS).
+
+A [`PtySession`](@ref) spawns a command with its stdin/stdout/stderr attached to
+the slave side of a fresh pty, while the session object wraps the master side as
+a normal Julia `IO`: `write`, `print`, `readline`, `readuntil`, `readavailable`,
+`eachline`, etc. all work and cooperate with the task scheduler.
+
+```julia
+using PtySessions
+
+session = PtySession(`cat`)
+write(session, "hello\\n")
+line = readline(session)   # "hello\\r" — the pty echoes input by default
+close(session)
+wait(session)
+```
+"""
 module PtySessions
 
-export PtySession, write, read, readline, readavailable, readuntil, write_with_timeout
-export isactive, close, kill, resize!, getsize
+export PtySession, expect, ExpectTimeoutError
 
-using Base: Process
+# The pty line discipline needs a signal we can't get from Base; value is 28 on
+# both Linux and macOS.
+const SIGWINCH = Cint(28)
 
-"""
-    PtySession
-
-Represents a pseudo-terminal session with a running process.
-
-# Fields
-- `process::Process`: The underlying process
-- `master_fd::Int`: Master PTY file descriptor
-"""
-mutable struct PtySession
-    process::Process
-    master_fd::Int
-
-    function PtySession(process::Process, master_fd::Int)
-        session = new(process, master_fd)
-        finalizer(close, session)
-        return session
-    end
-end
-
-const DEFAULT_READAVAILABLE_MAX_BYTES = 64 * 1024
-const DEFAULT_WRITE_TIMEOUT_S = 1.0
-const POLLIN = Int16(0x0001)
-const POLLHUP = Int16(0x0010)
-const ERRNO_EWOULDBLOCK = if isdefined(Libc, :EWOULDBLOCK)
-    getfield(Libc, :EWOULDBLOCK)
-else
-    # Linux exposes EAGAIN but not EWOULDBLOCK through Base.Libc. POSIX permits
-    # both names to identify the same condition.
-    Libc.EAGAIN
-end
-
-@inline _would_block(err) = err == Libc.EAGAIN || err == ERRNO_EWOULDBLOCK
-
-struct PollFd
-    fd::Cint
-    events::Int16
-    revents::Int16
-end
+const PendingBuffer = typeof(PipeBuffer())
 
 """
-    PtySession(cmd::Cmd; env=ENV, dir=pwd())
+    PtySession <: IO
 
-Create a new PTY session running the given command.
+A pseudo-terminal session: a child process whose standard streams are attached
+to the slave side of a pty, plus the master side wrapped as a Julia stream.
 
-# Arguments
-- `cmd::Cmd`: The command to run
-- `env`: Environment variables (default: current environment)
-- `dir`: Working directory (default: current directory)
+`PtySession` is an `IO`; reading from it reads the child's output (including
+terminal echo of anything written), and writing to it feeds the child's input.
+Reads and writes are integrated with Julia's event loop, so they block only the
+calling task, never the whole process.
 
-# Returns
-- `PtySession`: A new PTY session object
+Reading from a session is single-consumer: interleave [`expect`](@ref),
+`readline`, `readavailable`, etc. freely from one task, but don't read from
+the same session concurrently from multiple tasks.
+
+Construct with [`PtySession(cmd::Cmd)`](@ref); see [`isactive`](@ref),
+`wait(session)`, `kill(session)`, `close(session)` for lifecycle management.
+"""
+mutable struct PtySession <: IO
+    const process::Base.Process
+    const master::Base.TTY
+    const cmd::Cmd
+    # output already pulled off the master but not yet consumed by the user
+    # (expect reads ahead: data after a match arrives in the same chunk)
+    const pending::PendingBuffer
+    # in-flight `eof` waiter task, reused across expect calls that time out
+    reader::Union{Task, Nothing}
+    reader_generation::UInt
+    wait_generation::UInt
+    const reader_events::Channel{Tuple{UInt, UInt, Symbol}}
+    # keeps close from releasing and reusing the fd during ioctl/termios calls
+    const fd_lock::ReentrantLock
+end
+
+# ptsname(3) returns a pointer to static storage; serialize pty allocation so
+# concurrent tasks/threads can't interleave between ptsname and open.
+const PTY_ALLOC_LOCK = ReentrantLock()
+
+"""
+    PtySession(cmd::Cmd; env=nothing, dir=nothing, rows=24, cols=80, echo=true)
+
+Run `cmd` in a fresh pseudo-terminal and return the [`PtySession`](@ref)
+connected to it.
+
+The child process is placed in a new session (via `setsid`), with the pty slave
+as its stdin, stdout, and stderr, so it believes it is talking to a real
+terminal (`isatty` is true).
+
+# Keyword arguments
+- `env`: environment for the child (any value accepted by `setenv`, e.g. a
+  `Dict` or vector of `"k=v"` strings). `nothing` (the default) inherits the
+  current process environment. Note that when set, it *replaces* the entire
+  environment — include `"PATH"` if the command needs it.
+- `dir`: working directory for the child. `nothing` (the default) inherits the
+  current working directory.
+- `rows`, `cols`: initial window size of the pty, set before the child starts
+  (a fresh pty otherwise reports 0×0, which confuses terminal programs).
+- `echo`: whether the pty's line discipline echoes input back into the output
+  stream (terminal default). Pass `false` for clean scripted interaction where
+  written input should not reappear; see also [`setecho`](@ref).
+
+# Notes
+- With `echo=true`, written input reappears in the session's output, and line
+  endings in the output are CRLF (`"\\r\\n"`).
+- The child has no *controlling* terminal (libuv provides no `TIOCSCTTY`), so
+  control characters written to the session (e.g. `"\\x03"`) do not generate
+  signals; use `kill(session, sig)` to signal the session's process group.
 
 # Example
 ```julia
-session = PtySession(`bash`)
+session = PtySession(`sh`; dir="/tmp", echo=false)
 write(session, "echo hello\\n")
-output = readavailable(session)
-close(session)
 ```
 """
-function PtySession(cmd::Cmd; env=ENV, dir=pwd())
-    # Create a pseudo-terminal using Julia's built-in support
-    # Set up the command with environment and directory
-    cmd_with_env = setenv(cmd, env)
+function PtySession(cmd::Cmd; env=nothing, dir=nothing,
+                    rows::Integer=24, cols::Integer=80, echo::Bool=true)
+    (Sys.islinux() || Sys.isapple()) ||
+        error("PtySessions requires POSIX pty support and only supports Linux and macOS; got $(Sys.KERNEL)")
 
-    process = nothing
-    master_fd = -1
+    spawn_cmd = cmd
+    env === nothing || (spawn_cmd = setenv(spawn_cmd, env))
+    dir === nothing || (spawn_cmd = Cmd(spawn_cmd; dir=String(dir)))
 
-    try
-        # For true PTY support, we need to use ccall to posix_openpt, grantpt, unlockpt
-        master_fd = ccall(:posix_openpt, Cint, (Cint,), Base.Filesystem.JL_O_RDWR | Base.Filesystem.JL_O_NOCTTY)
-        if master_fd < 0
-            error("Failed to open pseudo-terminal master: $(Base.Libc.strerror())")
-        end
+    O_RDWR = Base.Filesystem.JL_O_RDWR
+    O_NOCTTY = Base.Filesystem.JL_O_NOCTTY
+    O_CLOEXEC = Base.Filesystem.JL_O_CLOEXEC
 
-        ret = ccall(:grantpt, Cint, (Cint,), master_fd)
-        if ret != 0
-            ccall(:close, Cint, (Cint,), master_fd)
-            error("Failed to grant pseudo-terminal: $(Base.Libc.strerror())")
-        end
-
-        ret = ccall(:unlockpt, Cint, (Cint,), master_fd)
-        if ret != 0
-            ccall(:close, Cint, (Cint,), master_fd)
-            error("Failed to unlock pseudo-terminal: $(Base.Libc.strerror())")
-        end
-
-        # Get the slave name
-        slave_name_ptr = ccall(:ptsname, Ptr{UInt8}, (Cint,), master_fd)
-        if slave_name_ptr == C_NULL
-            ccall(:close, Cint, (Cint,), master_fd)
-            error("Failed to get pseudo-terminal slave name: $(Base.Libc.strerror())")
-        end
-        slave_name = unsafe_string(slave_name_ptr)
-
-        # Open slave for the child process
-        slave_fd = ccall(:open, Cint, (Ptr{UInt8}, Cint), slave_name, Base.Filesystem.JL_O_RDWR)
-        if slave_fd < 0
-            ccall(:close, Cint, (Cint,), master_fd)
-            error("Failed to open pseudo-terminal slave: $(Base.Libc.strerror())")
-        end
-
-        # Create IO objects for slave (these will be used by the child process)
-        slave_io = fdio(slave_fd, true)
-
-        # Change to the requested directory and spawn the process
-        original_dir = pwd()
+    # Allocate the pty pair. O_NOCTTY on the slave open matters: without it, a
+    # session-leader Julia process without a controlling terminal would acquire
+    # this pty as its controlling terminal as a side effect. CLOEXEC keeps the
+    # pty fds out of unrelated child processes spawned concurrently elsewhere;
+    # our child receives its stdio copies via dup2, which clears CLOEXEC on the
+    # duplicates. Linux and macOS both accept O_CLOEXEC in posix_openpt, so set
+    # it atomically at allocation time. A later fcntl would race unrelated
+    # fork/exec activity in another thread.
+    local master_fd::Cint, slave_fd::Cint
+    lock(PTY_ALLOC_LOCK) do
+        master_fd = ccall(:posix_openpt, Cint, (Cint,), O_RDWR | O_NOCTTY | O_CLOEXEC)
+        Base.systemerror("posix_openpt", master_fd < 0)
         try
-            cd(dir)
-            # Spawn the process with the slave as stdin/stdout/stderr
-            process = run(pipeline(cmd_with_env, stdin=slave_io, stdout=slave_io, stderr=slave_io), wait=false)
-        finally
-            cd(original_dir)
-        end
-
-        # Close our reference to slave (child has it open)
-        close(slave_io)
-
-        F_GETFL = 3
-        F_SETFL = 4
-        flags = ccall(:fcntl, Cint, (Cint, Cint), master_fd, F_GETFL)
-        flags >= 0 && ccall(:fcntl, Cint, (Cint, Cint, Cint), master_fd, F_SETFL, flags | Base.Filesystem.JL_O_NONBLOCK)
-
-        # The master is now our interface to the process
-        return PtySession(process, Int(master_fd))
-
-    catch e
-        # Clean up on error
-        if master_fd >= 0
+            Base.systemerror("grantpt", ccall(:grantpt, Cint, (Cint,), master_fd) != 0)
+            Base.systemerror("unlockpt", ccall(:unlockpt, Cint, (Cint,), master_fd) != 0)
+            name_ptr = ccall(:ptsname, Ptr{UInt8}, (Cint,), master_fd)
+            Base.systemerror("ptsname", name_ptr == C_NULL)
+            slave_name = unsafe_string(name_ptr)
+            slave_fd = ccall(:open, Cint, (Cstring, Cint), slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC)
+            Base.systemerror("open($slave_name)", slave_fd < 0)
+        catch
             ccall(:close, Cint, (Cint,), master_fd)
+            rethrow()
         end
-        rethrow(e)
-    end
-end
-
-"""
-    Base.write(session::PtySession, data::Union{String, Vector{UInt8}})
-
-Write data to the PTY session.
-
-# Arguments
-- `session::PtySession`: The PTY session
-- `data`: Data to write (String or bytes)
-
-# Returns
-- Number of bytes written
-"""
-function Base.write(session::PtySession, data::Union{String, Vector{UInt8}})
-    if !isactive(session)
-        error("Cannot write to inactive session")
     end
 
-    bytes = data isa String ? Vector{UInt8}(data) : data
-    written = ccall(:write, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
-                    session.master_fd, bytes, length(bytes))
-
-    if written < 0
-        err = Libc.errno()
-        if _would_block(err)
-            return write_with_timeout(session, bytes)
-        end
-        error("Failed to write to PTY: $(Base.Libc.strerror())")
-    end
-
-    return Int(written)
-end
-
-"""
-    write_with_timeout(session::PtySession, data::Union{String, Vector{UInt8}}; timeout_s::Real=DEFAULT_WRITE_TIMEOUT_S)
-
-Write data to the PTY session without blocking longer than `timeout_s`.
-
-# Arguments
-- `session::PtySession`: The PTY session
-- `data`: Data to write (String or bytes)
-- `timeout_s`: Maximum time in seconds to attempt the write
-
-# Returns
-- Number of bytes written
-"""
-function write_with_timeout(session::PtySession, data::Union{String, Vector{UInt8}}; timeout_s::Real=DEFAULT_WRITE_TIMEOUT_S)
-    if !isactive(session)
-        error("Cannot write to inactive session")
-    end
-
-    bytes = data isa String ? Vector{UInt8}(data) : data
-    total = 0
-    total_length = length(bytes)
-    total_length == 0 && return 0
-
-    # Set to non-blocking for the write loop.
-    F_GETFL = 3
-    F_SETFL = 4
-    O_NONBLOCK = Base.Filesystem.JL_O_NONBLOCK
-
-    old_flags = ccall(:fcntl, Cint, (Cint, Cint), session.master_fd, F_GETFL)
-    old_flags < 0 && return 0
-    needs_restore = (old_flags & O_NONBLOCK) == 0
-    if needs_restore
-        set_ret = ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, old_flags | O_NONBLOCK)
-        set_ret != 0 && return 0
-    end
-    deadline = time() + max(0.0, timeout_s)
-
+    # Configure the terminal before the child starts, so it observes the
+    # requested size and echo mode from its very first read.
     try
-        while total < total_length
-            remaining = total_length - total
-            nwrite = ccall(:write, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
-                           session.master_fd, pointer(bytes, total + 1), remaining)
+        _set_winsize(master_fd, rows, cols)
+        echo || _set_echo(master_fd, false)
+    catch
+        ccall(:close, Cint, (Cint,), master_fd)
+        ccall(:close, Cint, (Cint,), slave_fd)
+        rethrow()
+    end
 
-            if nwrite > 0
-                total += nwrite
-                continue
-            elseif nwrite == 0
-                time() >= deadline && break
+    local master::Base.TTY
+    try
+        master = Base.TTY(RawFD(master_fd))  # takes ownership of master_fd
+    catch
+        ccall(:close, Cint, (Cint,), master_fd)
+        ccall(:close, Cint, (Cint,), slave_fd)
+        rethrow()
+    end
+
+    local process::Base.Process
+    try
+        # detach: the child calls setsid(2), getting its own session and
+        # process group like a program run from a real terminal.
+        slave = RawFD(slave_fd)
+        process = run(detach(spawn_cmd), slave, slave, slave; wait=false)
+    catch
+        close(master)
+        ccall(:close, Cint, (Cint,), slave_fd)
+        rethrow()
+    end
+
+    # The child holds its own dups of the slave; drop ours so that when the
+    # child exits, reads on the master see EOF.
+    ccall(:close, Cint, (Cint,), slave_fd)
+
+    events = Channel{Tuple{UInt, UInt, Symbol}}(32)
+    return PtySession(process, master, cmd, PipeBuffer(), nothing, 0, 0,
+                      events, ReentrantLock())
+end
+
+"""
+    PtySession(f::Function, cmd::Cmd; kwargs...)
+
+Run `f(session)` with a fresh [`PtySession`](@ref), guaranteeing cleanup: when
+`f` returns (or throws), the master side is closed, the child is given a grace
+period of `2` seconds to exit on its own (most terminal programs exit on EOF),
+then force-killed if necessary, and finally reaped. Returns `f`'s return value.
+
+```julia
+output = PtySession(`cat`) do session
+    write(session, "hi\\n")
+    readline(session)
+end
+```
+"""
+function PtySession(f::Function, cmd::Cmd; kwargs...)
+    session = PtySession(cmd; kwargs...)
+    try
+        return f(session)
+    finally
+        close(session)
+        if isactive(session)
+            grace = Timer(2.0) do _
+                isactive(session) && kill(session, Base.SIGKILL)
+            end
+            wait(session)
+            close(grace)
+        end
+    end
+end
+
+# Run `f` with the raw master fd while preventing close/fd reuse. The fd must
+# not escape the callback.
+function _with_master_fd(f::F, s::PtySession) where {F}
+    lock(s.fd_lock)
+    try
+        handle = s.master.handle
+        (isopen(s.master) && handle != C_NULL) ||
+            throw(Base.IOError("PtySession is closed", 0))
+        fd = Ref{Cint}(-1)
+        err = ccall(:uv_fileno, Cint, (Ptr{Cvoid}, Ptr{Cint}), handle, fd)
+        err == 0 || throw(Base.IOError("PtySession is closed", err))
+        return f(fd[])
+    finally
+        unlock(s.fd_lock)
+    end
+end
+
+# ── IO interface ────────────────────────────────────────────────────────────
+# Reads consult the pending (readahead) buffer first, then the master stream;
+# writes go straight to the master.
+
+# On Linux, read(2) on a pty master fails with EIO once the last slave fd is
+# closed (i.e. the child exited and its terminal hung up); macOS/BSD return a
+# clean EOF instead. Translate the hangup into EOF so sessions read uniformly
+# on both platforms. Data buffered before the hangup is never lost: the error
+# only surfaces once the stream's buffer is empty. Write errors are NOT
+# translated — writing to a hung-up session is a real error.
+_is_pty_hangup(e) = e isa Base.IOError && e.code == Base.UV_EIO
+
+function _eof(master::Base.TTY)
+    try
+        return eof(master)
+    catch e
+        _is_pty_hangup(e) && return true
+        rethrow()
+    end
+end
+
+Base.isopen(s::PtySession) = isopen(s.master)
+Base.eof(s::PtySession) = bytesavailable(s.pending) > 0 ? false : _eof(s.master)
+Base.bytesavailable(s::PtySession) = bytesavailable(s.pending) + bytesavailable(s.master)
+
+function Base.readavailable(s::PtySession)
+    if bytesavailable(s.pending) > 0
+        out = read(s.pending)
+        bytesavailable(s.master) > 0 && append!(out, readavailable(s.master))
+        return out
+    end
+    try
+        return readavailable(s.master)
+    catch e
+        _is_pty_hangup(e) && return UInt8[]
+        rethrow()
+    end
+end
+
+function Base.read(s::PtySession, ::Type{UInt8})
+    bytesavailable(s.pending) > 0 && return read(s.pending, UInt8)
+    try
+        return read(s.master, UInt8)
+    catch e
+        _is_pty_hangup(e) && throw(EOFError())
+        rethrow()
+    end
+end
+
+function Base.unsafe_read(s::PtySession, p::Ptr{UInt8}, n::UInt)
+    nb = UInt(bytesavailable(s.pending))
+    if nb > 0
+        k = min(n, nb)
+        unsafe_read(s.pending, p, k)
+        n -= k
+        p += k
+    end
+    if n > 0
+        try
+            unsafe_read(s.master, p, n)
+        catch e
+            _is_pty_hangup(e) && throw(EOFError())
+            rethrow()
+        end
+    end
+    return nothing
+end
+
+Base.write(s::PtySession, b::UInt8) = write(s.master, b)
+Base.unsafe_write(s::PtySession, p::Ptr{UInt8}, n::UInt) = unsafe_write(s.master, p, n)
+Base.flush(s::PtySession) = flush(s.master)
+Base.isreadable(s::PtySession) = bytesavailable(s.pending) > 0 || isreadable(s.master)
+Base.iswritable(s::PtySession) = iswritable(s.master)
+
+# ── expect ──────────────────────────────────────────────────────────────────
+
+"""
+    ExpectTimeoutError(pattern, timeout)
+
+Thrown by [`expect`](@ref) (and `readuntil` with a `timeout`) when the pattern
+does not appear in the session's output within `timeout` seconds. Any output
+consumed while waiting remains buffered and readable from the session.
+"""
+struct ExpectTimeoutError <: Exception
+    pattern::Union{String, Regex}
+    timeout::Float64
+end
+
+Base.showerror(io::IO, e::ExpectTimeoutError) =
+    print(io, "ExpectTimeoutError: no match for ", repr(e.pattern),
+          " in session output within ", e.timeout, " seconds")
+
+const DEFAULT_EXPECT_TIMEOUT = 30.0
+
+# Byte index in `data` of the end of the first match, or nothing. `searched` is
+# how many leading bytes a previous call already established contain no match:
+# a fixed string absent from data[1:searched] can only match starting within
+# its last patlen-1 bytes, so resume there instead of rescanning from the top
+# (keeps expect linear as output accumulates). A regex match can start anywhere
+# once new bytes arrive (e.g. r"a.*b"), so regexes always rescan in full.
+function _match_end(pattern::AbstractVector{UInt8}, data::Vector{UInt8}, searched::Int)
+    start = max(1, searched - length(pattern) + 2)
+    r = findnext(pattern, data, start)
+    return r === nothing ? nothing : last(r)
+end
+
+_match_end(pattern::AbstractString, data::Vector{UInt8}, searched::Int) =
+    _match_end(codeunits(String(pattern)), data, searched)
+
+function _match_end(pattern::Regex, data::Vector{UInt8}, searched::Int)
+    str = String(copy(data))
+    m = match(pattern, str)
+    m === nothing && return nothing
+    return m.offset + ncodeunits(m.match) - 1
+end
+
+# Append everything currently readable on the master to `data`.
+function _drain!(data::Vector{UInt8}, s::PtySession)
+    while bytesavailable(s.master) > 0
+        append!(data, readavailable(s.master))
+    end
+    return nothing
+end
+
+# Wait until the master has data (:data), reaches EOF (:eof), or the deadline
+# passes (:timeout). `eof` blocks until one of the first two, so one reusable
+# task publishes its result to a channel. A Timer publishes the timeout. Reader
+# and wait generations let us discard late events without polling.
+_remaining_timeout(started::UInt64, timeout::Float64, now::UInt64=time_ns()) =
+    timeout - Float64(now - started) / 1.0e9
+
+function _start_reader!(s::PtySession)
+    generation = s.reader_generation + 1
+    s.reader_generation = generation
+    stream = s.master
+    events = s.reader_events
+    task = @async begin
+        status, exception = try
+            (_eof(stream) ? :eof : :data), nothing
+        catch e
+            if !isopen(stream)
+                # Concurrent close tears down a waiter. Match the read-side EOF
+                # semantics used elsewhere instead of exposing an internal error.
+                :eof, nothing
             else
-                err = Libc.errno()
-                if err == Libc.EINTR
-                    continue
-                elseif _would_block(err)
-                    time() >= deadline && break
+                :error, e
+            end
+        end
+        put!(events, (generation, 0, status))
+        return status, exception
+    end
+    s.reader = task
+    return task, generation
+end
+
+function _finish_reader!(s::PtySession, task::Task)
+    s.reader === task && (s.reader = nothing)
+    status, exception = fetch(task)
+    status === :error && throw(exception)
+    return status::Symbol
+end
+
+function _wait_input(s::PtySession, started::UInt64, timeout::Float64)
+    bytesavailable(s.master) > 0 && return :data
+    t = s.reader
+    if t === nothing
+        t, reader_generation = _start_reader!(s)
+    elseif istaskdone(t)
+        return _finish_reader!(s, t)
+    else
+        reader_generation = s.reader_generation
+    end
+    while true
+        remaining = _remaining_timeout(started, timeout)
+        remaining <= 0 && return :timeout
+        s.wait_generation += 1
+        wait_generation = s.wait_generation
+        timer = if isfinite(remaining)
+            interval = min(remaining, 3600.0)
+            timer_status = remaining <= 3600.0 ? :timeout : :recheck
+            Timer(interval) do _
+                put!(s.reader_events,
+                     (reader_generation, wait_generation, timer_status))
+            end
+        else
+            nothing
+        end
+        try
+            while true
+                event_reader, event_wait, status = take!(s.reader_events)
+                event_reader == reader_generation || continue
+                if status === :data || status === :eof || status === :error
+                    return _finish_reader!(s, t)
+                end
+                event_wait == wait_generation || continue
+                if istaskdone(t)
+                    return _finish_reader!(s, t)
+                elseif status === :timeout
+                    return :timeout
                 else
-                    error("Failed to write to PTY: $(Base.Libc.strerror())")
+                    # A bounded internal timer expired for a very long user
+                    # timeout. Recompute the remaining monotonic duration.
+                    break
                 end
             end
-
-            sleep(0.01)
+        finally
+            timer === nothing || close(timer)
         end
-    finally
-        needs_restore && ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, old_flags)
     end
-
-    return total
 end
 
 """
-    Base.read(session::PtySession, nb::Integer)
+    expect(session::PtySession, pattern::Union{AbstractString, Regex};
+           timeout::Real=$(DEFAULT_EXPECT_TIMEOUT)) -> String
 
-Read specified number of bytes from the PTY session.
+Read from the session until its output matches `pattern`, and return
+everything read up to and including the match. Output arriving after the match
+stays buffered for subsequent reads.
 
-# Arguments
-- `session::PtySession`: The PTY session
-- `nb::Integer`: Number of bytes to read
+Throws [`ExpectTimeoutError`](@ref) if the pattern doesn't appear within
+`timeout` seconds, and `EOFError` if the session's output ends without a
+match; in both cases the output consumed while waiting remains buffered and
+readable (e.g. via `readavailable`).
 
-# Returns
-- Vector{UInt8}: The bytes read
+```julia
+session = PtySession(`sh`; echo=false)
+write(session, "echo result=\\\$((6 * 7))\\n")
+expect(session, r"result=\\d+")   # ⇒ "… result=42"
+```
 """
-function Base.read(session::PtySession, nb::Integer)
-    if session.master_fd < 0
-        return UInt8[]
-    end
-
-    buffer = Vector{UInt8}(undef, nb)
-    nread = ccall(:read, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
-                  session.master_fd, buffer, nb)
-
-    if nread < 0
-        return UInt8[]
-    end
-
-    return buffer[1:nread]
-end
-
-"""
-    Base.readline(session::PtySession; keep::Bool=false)
-
-Read a line from the PTY session.
-
-# Arguments
-- `session::PtySession`: The PTY session
-- `keep::Bool`: Whether to keep the newline character
-
-# Returns
-- String: The line read
-"""
-function Base.readline(session::PtySession; keep::Bool=false)
-    if session.master_fd < 0
-        return ""
-    end
-
-    result = IOBuffer()
-    while true
-        buffer = Vector{UInt8}(undef, 1)
-        nread = ccall(:read, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
-                      session.master_fd, buffer, 1)
-
-        if nread <= 0
-            break
-        end
-
-        c = Char(buffer[1])
-        if c == '\n'
-            keep && write(result, c)
-            break
-        end
-        write(result, c)
-    end
-
-    return String(take!(result))
-end
-
-"""
-    readavailable(session::PtySession; max_bytes::Integer=DEFAULT_READAVAILABLE_MAX_BYTES)
-
-Read all currently available data from the PTY session without blocking.
-
-# Arguments
-- `session::PtySession`: The PTY session
-- `max_bytes::Integer`: Maximum bytes to read before returning (default: $(DEFAULT_READAVAILABLE_MAX_BYTES))
-
-# Returns
-- String: The available data
-"""
-function readavailable(session::PtySession; max_bytes::Integer=DEFAULT_READAVAILABLE_MAX_BYTES)
-    if session.master_fd < 0
-        return ""
-    end
-    max_bytes <= 0 && return ""
-
-    F_GETFL = 3
-    F_SETFL = 4
-    O_NONBLOCK = Base.Filesystem.JL_O_NONBLOCK
-    flags = ccall(:fcntl, Cint, (Cint, Cint), session.master_fd, F_GETFL)
-    if flags >= 0 && (flags & O_NONBLOCK) == 0
-        set_ret = ccall(:fcntl, Cint, (Cint, Cint, Cint), session.master_fd, F_SETFL, flags | O_NONBLOCK)
-        set_ret != 0 && return ""
-    end
-
-    pfd = Ref(PollFd(Cint(session.master_fd), POLLIN, 0))
-    poll_ret = ccall(:poll, Cint, (Ptr{PollFd}, Cuint, Cint), pfd, 1, 0)
-    poll_ret <= 0 && return ""
-    revents = pfd[].revents
-    (revents & (POLLIN | POLLHUP)) == 0 && return ""
-
-    buffer = Vector{UInt8}(undef, min(4096, max_bytes))
-    nread = ccall(:read, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
-                  session.master_fd, buffer, length(buffer))
-    if nread > 0
-        return String(buffer[1:nread])
-    elseif nread == 0
-        return ""
-    end
-
-    err = Libc.errno()
-    if err == Libc.EINTR || _would_block(err)
-        return ""
-    end
-    return ""
-end
-
-"""
-    Base.readuntil(session::PtySession, marker::Union{Char, String}; timeout=nothing)
-
-Read from the PTY session until a marker is found or timeout occurs.
-
-# Arguments
-- `session::PtySession`: The PTY session
-- `marker`: Character or string to read until
-- `timeout`: Optional timeout in seconds
-
-# Returns
-- String: The data read up to and including the marker
-"""
-function Base.readuntil(session::PtySession, marker::Union{Char, String}; timeout=nothing)
-    if session.master_fd < 0
-        return ""
-    end
-
-    result = IOBuffer()
-    marker_str = string(marker)
-    start_time = time()
-
-    while timeout === nothing || (time() - start_time < timeout)
-        buffer = Vector{UInt8}(undef, 1)
-        nread = ccall(:read, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
-                      session.master_fd, buffer, 1)
-
-        if nread <= 0
-            if timeout === nothing
-                break
-            else
-                sleep(0.01)
-                continue
+function expect(s::PtySession, pattern::Union{AbstractString, Regex};
+                timeout::Real=DEFAULT_EXPECT_TIMEOUT)
+    timeout_s = Float64(timeout)
+    timeout_s > 0 || throw(ArgumentError("timeout must be positive, got $timeout"))
+    pattern isa AbstractString && isempty(pattern) &&
+        throw(ArgumentError("pattern must be non-empty"))
+    started = time_ns()
+    saw_eof = false
+    searched = 0
+    data = read(s.pending)
+    search_pattern = pattern isa Regex ? pattern : collect(codeunits(String(pattern)))
+    try
+        while true
+            _drain!(data, s)
+            stop = _match_end(search_pattern, data, searched)
+            if stop !== nothing
+                output = String(data[1:stop])
+                write(s.pending, @view data[stop+1:end])
+                return output
+            end
+            searched = length(data)
+            saw_eof && throw(EOFError())
+            status = _wait_input(s, started, timeout_s)
+            if status === :timeout
+                throw(ExpectTimeoutError(pattern isa Regex ? pattern : String(pattern),
+                                         timeout_s))
+            elseif status === :eof
+                saw_eof = true
             end
         end
-
-        write(result, buffer[1])
-
-        # Check if we've hit the marker
-        current = String(take!(result))
-        if endswith(current, marker_str)
-            return current
-        end
-        # Put it back
-        write(result, current)
-    end
-
-    return String(take!(result))
-end
-
-"""
-    isactive(session::PtySession)
-
-Check if the PTY session is still active (process is running).
-
-# Arguments
-- `session::PtySession`: The PTY session
-
-# Returns
-- Bool: true if active, false otherwise
-"""
-function isactive(session::PtySession)
-    return process_running(session.process)
-end
-
-"""
-    Base.wait(session::PtySession)
-
-Wait for the PTY session to complete.
-
-# Arguments
-- `session::PtySession`: The PTY session
-
-# Returns
-- The process exit status
-"""
-function Base.wait(session::PtySession)
-    return wait(session.process)
-end
-
-"""
-    Base.kill(session::PtySession, signal::Integer=Base.SIGTERM)
-
-Send a signal to the PTY session process.
-
-# Arguments
-- `session::PtySession`: The PTY session
-- `signal::Integer`: Signal to send (default: SIGTERM)
-"""
-function Base.kill(session::PtySession, signal::Integer=Base.SIGTERM)
-    if isactive(session)
-        kill(session.process, signal)
-    end
-end
-
-"""
-    Base.close(session::PtySession)
-
-Close the PTY session and clean up resources.
-
-# Arguments
-- `session::PtySession`: The PTY session
-"""
-function Base.close(session::PtySession)
-    # Close the file descriptor first (this will cause the process to terminate)
-    if session.master_fd >= 0
-        try
-            io = fdio(session.master_fd, false)
-            close(io)
-        catch
-        end
-        session.master_fd = -1
-    end
-
-    # Try to kill the process if still running (non-blocking)
-    try
-        if isactive(session)
-            kill(session, Base.SIGKILL)
-        end
     catch
-        # Ignore errors during cleanup
+        # expect consumes no output when it fails. Restore all accumulated data
+        # once, so ordinary reads or another expect can continue from it.
+        write(s.pending, data)
+        rethrow()
     end
+end
 
+"""
+    readuntil(session::PtySession, delim::AbstractString;
+              keep::Bool=false, timeout::Real=Inf) -> String
+
+Like `Base.readuntil`, with an optional `timeout` in seconds: read until
+`delim` appears in the session's output and return everything before it
+(including it when `keep=true`). Returns the data read so far if the output
+ends before `delim` appears; throws [`ExpectTimeoutError`](@ref) on timeout.
+"""
+function Base.readuntil(s::PtySession, delim::AbstractString;
+                        keep::Bool=false, timeout::Real=Inf)
+    isempty(delim) && return ""
+    matched = try
+        expect(s, delim; timeout=timeout)
+    catch e
+        # Base.readuntil semantics: EOF before the delimiter yields the data
+        # read so far rather than throwing
+        e isa EOFError && return String(read(s.pending))
+        rethrow()
+    end
+    keep && return matched
+    bytes = codeunits(matched)
+    return String(bytes[1:end-ncodeunits(String(delim))])
+end
+
+Base.readuntil(s::PtySession, delim::AbstractChar; kwargs...) =
+    readuntil(s, string(delim); kwargs...)
+
+"""
+    close(session::PtySession; force::Bool=false)
+
+Close the master side of the pty. Children that read their terminal observe
+the hangup (end-of-file on macOS/BSD, `EIO` on Linux) and typically exit on
+their own — though their exit status after a hangup is platform-dependent.
+Call `wait(session)` afterwards to reap the process. With `force=true`, also
+send `SIGKILL` to the session process group if its leader is still running.
+"""
+function Base.close(s::PtySession; force::Bool=false)
+    force && isactive(s) && kill(s, Base.SIGKILL)
+    lock(s.fd_lock)
+    try
+        close(s.master)
+    finally
+        unlock(s.fd_lock)
+    end
+    return nothing
+end
+
+# ── Process management ──────────────────────────────────────────────────────
+
+"""
+    isactive(session::PtySession) -> Bool
+
+Return `true` while the session's child process is still running.
+"""
+isactive(s::PtySession) = Base.process_running(s.process)
+
+"""
+    wait(session::PtySession)
+
+Wait for the session's child process to exit.
+"""
+Base.wait(s::PtySession) = wait(s.process)
+
+"""
+    kill(session::PtySession, signum=Base.SIGTERM)
+
+Send the signal `signum` to the session's private process group, including
+descendants that remain in that group. No-op if the session leader has already
+exited.
+"""
+function Base.kill(s::PtySession, signum::Integer=Base.SIGTERM)
+    Base.process_running(s.process) || return nothing
+    pid = try
+        getpid(s.process)
+    catch
+        return nothing
+    end
+    ret = ccall(:kill, Cint, (Cint, Cint), -Cint(pid), Cint(signum))
+    ret == 0 && return nothing
+    err = Base.Libc.errno()
+    err == Base.Libc.ESRCH && return nothing
+    Base.systemerror("kill(process group)", err)
+end
+
+"""
+    getpid(session::PtySession) -> Int
+
+Return the OS process ID of the session's child process. Throws if the process
+has already exited.
+"""
+Base.getpid(s::PtySession) = getpid(s.process)
+
+"""
+    process_running(session::PtySession) -> Bool
+    process_exited(session::PtySession) -> Bool
+
+Whether the session's child process is still running / has exited.
+`process_running` is the same as [`isactive`](@ref).
+"""
+Base.process_running(s::PtySession) = Base.process_running(s.process)
+Base.process_exited(s::PtySession) = Base.process_exited(s.process)
+
+"""
+    success(session::PtySession) -> Bool
+
+Wait for the session's child process to exit and return `true` if it exited
+with status 0 and was not killed by a signal.
+"""
+Base.success(s::PtySession) = success(s.process)
+
+"""
+    exitcode(session::PtySession) -> Int
+
+Exit status of the session's child process. Throws if the process is still
+running. Note that for a child killed by a signal, see
+`Base.process_signaled`/`s.process.termsignal`.
+"""
+function exitcode(s::PtySession)
+    Base.process_exited(s.process) ||
+        throw(ArgumentError("process has not exited; call wait(session) first"))
+    return Int(s.process.exitcode)
+end
+
+function Base.show(io::IO, s::PtySession)
+    print(io, "PtySession(", s.cmd, ", ")
+    # the process can exit between the check and the pid query; show must not throw
+    pid = Base.process_running(s.process) ? (try; getpid(s); catch; nothing; end) : nothing
+    if pid !== nothing
+        print(io, "running, pid=", pid)
+    elseif Base.process_exited(s.process)
+        print(io, "exited, code=", s.process.exitcode)
+    else
+        print(io, "running")
+    end
+    isopen(s) || print(io, ", closed")
+    print(io, ")")
+end
+
+# ── Terminal size ───────────────────────────────────────────────────────────
+
+struct WinSize
+    ws_row::UInt16
+    ws_col::UInt16
+    ws_xpixel::UInt16
+    ws_ypixel::UInt16
+end
+
+@static if Sys.isapple()
+    const TIOCGWINSZ = Culong(0x40087468)
+    const TIOCSWINSZ = Culong(0x80087467)
+else
+    const TIOCGWINSZ = Culong(0x5413)
+    const TIOCSWINSZ = Culong(0x5414)
+end
+
+function _set_winsize(fd::Cint, rows::Integer, cols::Integer)
+    (0 <= rows <= typemax(UInt16) && 0 <= cols <= typemax(UInt16)) ||
+        throw(ArgumentError("rows and cols must be in 0:$(typemax(UInt16)), got ($rows, $cols)"))
+    ws = Ref(WinSize(rows, cols, 0, 0))
+    # ioctl(2) is variadic; the trailing `...` matters for ABI correctness
+    # (on aarch64-darwin, variadic args are passed on the stack).
+    ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{WinSize}...), fd, TIOCSWINSZ, ws)
+    Base.systemerror("ioctl(TIOCSWINSZ)", ret != 0)
     return nothing
 end
 
 """
-    resize!(session::PtySession, rows::Int, cols::Int)
+    resize!(session::PtySession, rows::Integer, cols::Integer)
 
-Resize the PTY window.
-
-# Arguments
-- `session::PtySession`: The PTY session
-- `rows::Int`: Number of rows
-- `cols::Int`: Number of columns
+Set the pty's window size and notify the child with `SIGWINCH`. The child can
+observe the new size (e.g. via `TIOCGWINSZ`, `stty size`, or
+`\$LINES`/`\$COLUMNS` updates in shells).
 """
-function resize!(session::PtySession, rows::Int, cols::Int)
-    if !isactive(session)
-        error("Cannot resize inactive session")
+function Base.resize!(s::PtySession, rows::Integer, cols::Integer)
+    _with_master_fd(s) do fd
+        _set_winsize(fd, rows, cols)
     end
+    # The child has no controlling terminal, so the kernel won't deliver
+    # SIGWINCH on our behalf; notify its process group directly.
+    isactive(s) && kill(s, SIGWINCH)
+    return s
+end
 
-    # Get the file descriptor
-    fd = session.master_fd
+"""
+    getsize(session::PtySession) -> (rows, cols)
 
-    # Define the winsize struct (from sys/ioctl.h)
-    # struct winsize {
-    #     unsigned short ws_row;
-    #     unsigned short ws_col;
-    #     unsigned short ws_xpixel;
-    #     unsigned short ws_ypixel;
-    # };
-    winsize = zeros(UInt16, 4)
-    winsize[1] = UInt16(rows)
-    winsize[2] = UInt16(cols)
-    winsize[3] = UInt16(0)  # xpixel (unused)
-    winsize[4] = UInt16(0)  # ypixel (unused)
-
-    # TIOCSWINSZ constant (from sys/ioctl.h)
-    # On macOS: 0x80087467
-    # On Linux: 0x5414
-    @static if Sys.isapple()
-        TIOCSWINSZ = 0x80087467
-    elseif Sys.islinux()
-        TIOCSWINSZ = 0x5414
-    else
-        error("Unsupported platform for resize!")
+Return the pty's current window size.
+"""
+function getsize(s::PtySession)
+    ws = Ref(WinSize(0, 0, 0, 0))
+    _with_master_fd(s) do fd
+        ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{WinSize}...), fd, TIOCGWINSZ, ws)
+        Base.systemerror("ioctl(TIOCGWINSZ)", ret != 0)
     end
+    return (Int(ws[].ws_row), Int(ws[].ws_col))
+end
 
-    ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{UInt16}), fd, TIOCSWINSZ, winsize)
-    if ret != 0
-        error("Failed to resize PTY: $(Libc.strerror())")
-    end
+Base.displaysize(s::PtySession) = getsize(s)
 
+# ── Echo control ────────────────────────────────────────────────────────────
+
+# We only need the c_lflag field of struct termios, whose layout differs per
+# platform: glibc has 32-bit tcflag_t with c_lflag at offset 12 (60-byte
+# struct); Darwin has 64-bit tcflag_t with c_lflag at offset 24 (72-byte
+# struct). ECHO is 0x8 and TCSANOW is 0 on both.
+@static if Sys.isapple()
+    const TERMIOS_SIZE = 72
+    const LFLAG_OFFSET = 24
+    const Tcflag = UInt64
+else
+    const TERMIOS_SIZE = 60
+    const LFLAG_OFFSET = 12
+    const Tcflag = UInt32
+end
+const ECHO_FLAG = Tcflag(0x8)
+const TCSANOW = Cint(0)
+
+function _get_lflag(fd::Cint)
+    buf = zeros(UInt8, TERMIOS_SIZE)
+    ret = ccall(:tcgetattr, Cint, (Cint, Ptr{UInt8}), fd, buf)
+    Base.systemerror("tcgetattr", ret != 0)
+    lflag = GC.@preserve buf unsafe_load(Ptr{Tcflag}(pointer(buf, LFLAG_OFFSET + 1)))
+    return lflag, buf
+end
+
+function _set_echo(fd::Cint, on::Bool)
+    lflag, buf = _get_lflag(fd)
+    lflag = on ? (lflag | ECHO_FLAG) : (lflag & ~ECHO_FLAG)
+    GC.@preserve buf unsafe_store!(Ptr{Tcflag}(pointer(buf, LFLAG_OFFSET + 1)), lflag)
+    ret = ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{UInt8}), fd, TCSANOW, buf)
+    Base.systemerror("tcsetattr", ret != 0)
     return nothing
 end
 
 """
-    getsize(session::PtySession)
+    setecho(session::PtySession, on::Bool)
 
-Get the current PTY window size.
-
-# Arguments
-- `session::PtySession`: The PTY session
-
-# Returns
-- Tuple{Int, Int}: (rows, columns)
+Enable or disable the pty's input echo. With echo off, data written to the
+session no longer reappears in its output — usually what you want for scripted
+interaction. See also the `echo` keyword of [`PtySession`](@ref) to configure
+this before the child starts.
 """
-function getsize(session::PtySession)
-    if !isactive(session)
-        error("Cannot get size of inactive session")
+function setecho(s::PtySession, on::Bool)
+    _with_master_fd(s) do fd
+        _set_echo(fd, on)
     end
-
-    # Get the file descriptor
-    fd = session.master_fd
-
-    # Create winsize struct to receive the size
-    winsize = zeros(UInt16, 4)
-
-    # TIOCGWINSZ constant
-    @static if Sys.isapple()
-        TIOCGWINSZ = 0x40087468
-    elseif Sys.islinux()
-        TIOCGWINSZ = 0x5413
-    else
-        error("Unsupported platform for getsize")
-    end
-
-    ret = ccall(:ioctl, Cint, (Cint, Culong, Ptr{UInt16}), fd, TIOCGWINSZ, winsize)
-    if ret != 0
-        error("Failed to get PTY size: $(Libc.strerror())")
-    end
-
-    rows = Int(winsize[1])
-    cols = Int(winsize[2])
-
-    return (rows, cols)
+    return nothing
 end
 
 """
-    getpid(session::PtySession)
+    getecho(session::PtySession) -> Bool
 
-Get the process ID of the PTY session.
-
-# Arguments
-- `session::PtySession`: The PTY session
-
-# Returns
-- Int: The process ID
+Return whether the pty currently echoes input.
 """
-function getpid(session::PtySession)
-    return Base.getpid(session.process)
+getecho(s::PtySession) = _with_master_fd(s) do fd
+    (_get_lflag(fd)[1] & ECHO_FLAG) != 0
 end
 
 end # module PtySessions
