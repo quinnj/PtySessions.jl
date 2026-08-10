@@ -192,7 +192,9 @@ end
 
 @testset "process management" begin
     s = PtySession(`cat`)
-    @test getpid(s) > 0
+    pid = getpid(s)
+    @test pid > 0
+    @test ccall(:getpgid, Cint, (Cint,), Cint(pid)) == pid
     kill(s)              # SIGTERM by default
     wait(s)
     @test !PtySessions.isactive(s)
