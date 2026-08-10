@@ -403,14 +403,15 @@ end
 @testset "concurrent sessions" begin
     n = 6
     outs = Vector{String}(undef, n)
-    @sync for i in 1:n
-        @async begin
-            s = PtySession(`sh -c $("echo session-$i")`)
-            outs[i] = read(s, String)
-            wait(s)
-            close(s)
-        end
+    thread_ids = Vector{Int}(undef, n)
+    Threads.@threads :static for i in 1:n
+        thread_ids[i] = Threads.threadid()
+        s = PtySession(`sh -c $("echo session-$i")`)
+        outs[i] = read(s, String)
+        wait(s)
+        close(s)
     end
+    Threads.nthreads() > 1 && @test length(unique(thread_ids)) > 1
     for i in 1:n
         @test occursin("session-$i", outs[i])
     end
