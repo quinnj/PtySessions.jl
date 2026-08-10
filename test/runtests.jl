@@ -221,6 +221,13 @@ end
 
     @test_throws ArgumentError expect(s, ""; timeout=5)
     @test_throws ArgumentError expect(s, "x"; timeout=0)
+
+    # Real-valued timeouts are normalized once, and elapsed time uses the
+    # monotonic clock rather than the adjustable wall clock.
+    write(s, "bigfloat-timeout\n")
+    @test occursin("bigfloat-timeout", expect(s, "bigfloat-timeout"; timeout=big"5.0"))
+    @test PtySessions._remaining_timeout(UInt64(100), 2.0,
+                                         UInt64(1_000_000_100)) == 1.0
     close(s; force=true)
     wait(s)
 end

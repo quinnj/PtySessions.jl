@@ -352,7 +352,10 @@ end
 # passes (:timeout). `eof` blocks until one of the first two, so we run it in a
 # task and poll for its completion; a task orphaned by a timeout is kept and
 # reused by the next call instead of leaking one task per attempt.
-function _wait_input(s::PtySession, deadline::Float64)
+_remaining_timeout(started::UInt64, timeout::Float64, now::UInt64=time_ns()) =
+    timeout - Float64(now - started) / 1.0e9
+
+function _wait_input(s::PtySession, started::UInt64, timeout::Float64)
     bytesavailable(s.master) > 0 && return :data
     t = s.reader
     if t === nothing || istaskdone(t)
@@ -360,9 +363,16 @@ function _wait_input(s::PtySession, deadline::Float64)
         t = @async _eof(stream)
         s.reader = t
     end
-    remaining = min(deadline - time(), 3600.0)  # timedwait needs a finite timeout
-    remaining <= 0 && return :timeout
-    timedwait(() -> istaskdone(t), remaining; pollint=0.01) === :timed_out && return :timeout
+    while true
+        remaining = _remaining_timeout(started, timeout)
+        remaining <= 0 && return :timeout
+        # timedwait requires a finite duration. Recheck an infinite or very
+        # long deadline in bounded intervals without treating the interval as
+        # the user's timeout.
+        interval = min(remaining, 3600.0)
+        timedwait(() -> istaskdone(t), interval; pollint=0.01) === :ok && break
+        remaining <= 3600.0 && return :timeout
+    end
     # a failed waiter means the stream was torn down under us: treat as EOF
     done = try
         fetch(t)::Bool
@@ -393,10 +403,11 @@ expect(session, r"result=\\d+")   # ⇒ "… result=42"
 """
 function expect(s::PtySession, pattern::Union{AbstractString, Regex};
                 timeout::Real=DEFAULT_EXPECT_TIMEOUT)
-    timeout > 0 || throw(ArgumentError("timeout must be positive, got $timeout"))
+    timeout_s = Float64(timeout)
+    timeout_s > 0 || throw(ArgumentError("timeout must be positive, got $timeout"))
     pattern isa AbstractString && isempty(pattern) &&
         throw(ArgumentError("pattern must be non-empty"))
-    deadline = time() + timeout
+    started = time_ns()
     saw_eof = false
     searched = 0
     while true
@@ -410,10 +421,10 @@ function expect(s::PtySession, pattern::Union{AbstractString, Regex};
         searched = length(data)
         write(s.pending, data)
         saw_eof && throw(EOFError())
-        status = _wait_input(s, deadline)
+        status = _wait_input(s, started, timeout_s)
         if status === :timeout
             throw(ExpectTimeoutError(pattern isa Regex ? pattern : String(pattern),
-                                     Float64(timeout)))
+                                     timeout_s))
         elseif status === :eof
             saw_eof = true
         end
