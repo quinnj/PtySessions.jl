@@ -221,6 +221,17 @@ end
     @test time() - start < 10
     @test occursin("leftover", String(readavailable(s)))
 
+    # Repeated timeouts reuse one reader task. Late timer events must not make
+    # the next wait time out early, and new data must still wake it.
+    @test_throws ExpectTimeoutError expect(s, "wake-after-timeouts"; timeout=0.05)
+    reader = s.reader
+    @test reader !== nothing && !istaskdone(reader)
+    @test_throws ExpectTimeoutError expect(s, "wake-after-timeouts"; timeout=0.05)
+    @test s.reader === reader
+    write(s, "wake-after-timeouts\n")
+    @test occursin("wake-after-timeouts",
+                   expect(s, "wake-after-timeouts"; timeout=5))
+
     @test_throws ArgumentError expect(s, ""; timeout=5)
     @test_throws ArgumentError expect(s, "x"; timeout=0)
 

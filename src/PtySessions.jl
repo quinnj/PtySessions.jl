@@ -56,6 +56,9 @@ mutable struct PtySession <: IO
     const pending::PendingBuffer
     # in-flight `eof` waiter task, reused across expect calls that time out
     reader::Union{Task, Nothing}
+    reader_generation::UInt
+    wait_generation::UInt
+    const reader_events::Channel{Tuple{UInt, UInt, Symbol}}
     # keeps close from releasing and reusing the fd during ioctl/termios calls
     const fd_lock::ReentrantLock
 end
@@ -175,7 +178,9 @@ function PtySession(cmd::Cmd; env=nothing, dir=nothing,
     # child exits, reads on the master see EOF.
     ccall(:close, Cint, (Cint,), slave_fd)
 
-    return PtySession(process, master, cmd, PipeBuffer(), nothing, ReentrantLock())
+    events = Channel{Tuple{UInt, UInt, Symbol}}(32)
+    return PtySession(process, master, cmd, PipeBuffer(), nothing, 0, 0,
+                      events, ReentrantLock())
 end
 
 """
@@ -351,37 +356,84 @@ function _drain!(data::Vector{UInt8}, s::PtySession)
 end
 
 # Wait until the master has data (:data), reaches EOF (:eof), or the deadline
-# passes (:timeout). `eof` blocks until one of the first two, so we run it in a
-# task and poll for its completion; a task orphaned by a timeout is kept and
-# reused by the next call instead of leaking one task per attempt.
+# passes (:timeout). `eof` blocks until one of the first two, so one reusable
+# task publishes its result to a channel. A Timer publishes the timeout. Reader
+# and wait generations let us discard late events without polling.
 _remaining_timeout(started::UInt64, timeout::Float64, now::UInt64=time_ns()) =
     timeout - Float64(now - started) / 1.0e9
+
+function _start_reader!(s::PtySession)
+    generation = s.reader_generation + 1
+    s.reader_generation = generation
+    stream = s.master
+    events = s.reader_events
+    task = @async begin
+        status = try
+            _eof(stream) ? :eof : :data
+        catch
+            # Concurrent close tears down a waiter. Match the read-side EOF
+            # semantics used elsewhere instead of exposing TaskFailedException.
+            :eof
+        end
+        put!(events, (generation, 0, status))
+        return status
+    end
+    s.reader = task
+    return task, generation
+end
+
+function _finish_reader!(s::PtySession, task::Task)
+    s.reader === task && (s.reader = nothing)
+    return fetch(task)::Symbol
+end
 
 function _wait_input(s::PtySession, started::UInt64, timeout::Float64)
     bytesavailable(s.master) > 0 && return :data
     t = s.reader
-    if t === nothing || istaskdone(t)
-        stream = s.master
-        t = @async _eof(stream)
-        s.reader = t
+    if t === nothing
+        t, reader_generation = _start_reader!(s)
+    elseif istaskdone(t)
+        return _finish_reader!(s, t)
+    else
+        reader_generation = s.reader_generation
     end
     while true
         remaining = _remaining_timeout(started, timeout)
         remaining <= 0 && return :timeout
-        # timedwait requires a finite duration. Recheck an infinite or very
-        # long deadline in bounded intervals without treating the interval as
-        # the user's timeout.
-        interval = min(remaining, 3600.0)
-        timedwait(() -> istaskdone(t), interval; pollint=0.01) === :ok && break
-        remaining <= 3600.0 && return :timeout
+        s.wait_generation += 1
+        wait_generation = s.wait_generation
+        timer = if isfinite(remaining)
+            interval = min(remaining, 3600.0)
+            timer_status = remaining <= 3600.0 ? :timeout : :recheck
+            Timer(interval) do _
+                put!(s.reader_events,
+                     (reader_generation, wait_generation, timer_status))
+            end
+        else
+            nothing
+        end
+        try
+            while true
+                event_reader, event_wait, status = take!(s.reader_events)
+                event_reader == reader_generation || continue
+                if status === :data || status === :eof
+                    return _finish_reader!(s, t)
+                end
+                event_wait == wait_generation || continue
+                if istaskdone(t)
+                    return _finish_reader!(s, t)
+                elseif status === :timeout
+                    return :timeout
+                else
+                    # A bounded internal timer expired for a very long user
+                    # timeout. Recompute the remaining monotonic duration.
+                    break
+                end
+            end
+        finally
+            timer === nothing || close(timer)
+        end
     end
-    # a failed waiter means the stream was torn down under us: treat as EOF
-    done = try
-        fetch(t)::Bool
-    catch
-        true
-    end
-    return done ? :eof : :data
 end
 
 """
